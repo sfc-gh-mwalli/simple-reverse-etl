@@ -1,0 +1,17 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: simple-reverse-etl-demo-mysql
+    command: --local-infile=1
+    environment:
+      MYSQL_ROOT_PASSWORD: demopw
+      MYSQL_DATABASE: DENTAL_RPT
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./mysql_init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-pdemopw"]
+      interval: 5s
+      timeout: 5s
+      retries: 20

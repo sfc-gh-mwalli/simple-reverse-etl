@@ -1,0 +1,14 @@
+# On-prem Python job: read from Snowflake -> write to MySQL / SQL Server.
+# Pin/adjust versions to whatever your organization's approved package index allows.
+
+# Snowflake read side (Arrow/pandas fetch = compressed, batched, high throughput)
+snowflake-connector-python[pandas]>=3.12
+
+# Key-pair auth (production path; not needed for the PAT demo but harmless to install)
+cryptography>=42.0
+
+# MySQL target
+PyMySQL>=1.1
+
+# SQL Server target (also needs the OS-level "ODBC Driver 18 for SQL Server")
+pyodbc>=5.1

@@ -1,0 +1,14 @@
+-- Simulates a pipeline run: 2 updated claims + 3 new claims, all stamped "now"
+-- so they land above the watermark captured after the initial full load.
+UPDATE SIMPLE_REVERSE_ETL_DEMO.DENTAL.DENTAL_CLAIMS
+   SET CLAIM_STATUS = 'PAID',
+       AMOUNT       = AMOUNT + 100.00,
+       UPDATED_AT   = CURRENT_TIMESTAMP()
+ WHERE CLAIM_ID IN (1, 2);
+
+INSERT INTO SIMPLE_REVERSE_ETL_DEMO.DENTAL.DENTAL_CLAIMS
+    (CLAIM_ID, MEMBER_ID, CLAIM_STATUS, AMOUNT, UPDATED_AT)
+VALUES
+    (21, 55555, 'SUBMITTED', 321.00, CURRENT_TIMESTAMP()),
+    (22, 66666, 'SUBMITTED', 654.00, CURRENT_TIMESTAMP()),
+    (23, 77777, 'DENIED',    987.00, CURRENT_TIMESTAMP());

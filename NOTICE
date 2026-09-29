@@ -1,0 +1,19 @@
+# NOTICE
+
+SimpleReverseETL is licensed under the MIT License (see LICENSE).
+
+This project depends on the following third-party components, each under its own
+license. Their licenses are not superseded by this project's MIT license.
+
+| Component | Purpose | License |
+|---|---|---|
+| [snowflake-connector-python](https://pypi.org/project/snowflake-connector-python/) | Read from Snowflake; unload/GET | Apache-2.0 |
+| [pandas](https://pypi.org/project/pandas/) | In-memory result frames | BSD-3-Clause |
+| [pyarrow](https://pypi.org/project/pyarrow/) | Arrow result batches (pulled in by the connector) | Apache-2.0 |
+| [PyMySQL](https://pypi.org/project/PyMySQL/) | MySQL target driver | MIT |
+| [pyodbc](https://pypi.org/project/pyodbc/) | SQL Server target driver | MIT-0 |
+| [cryptography](https://pypi.org/project/cryptography/) | Key-pair (RSA) auth | Apache-2.0 OR BSD-3-Clause |
+| [keyring](https://pypi.org/project/keyring/) | Optional SSO token cache (demo convenience) | MIT |
+
+Installing the Snowflake connector may pull in additional transitive dependencies;
+consult each package's distribution for its authoritative license text.

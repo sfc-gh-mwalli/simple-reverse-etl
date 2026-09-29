@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+demo/.venv/
+.venv/
+
+# Local secrets / config (only the *.example templates are tracked)
+.env
+demo/.env.demo
+
+# Runtime artifacts
+sync_state.json
+sync_state_unload.json
+_unload_tmp/
+*.gz
+*.csv
+
+# CoCo workspace metadata and plans
+.snowflake/
+
+# OS
+.DS_Store

@@ -1,0 +1,4 @@
+# Lightweight deps for the MySQL demo (no pyodbc / SQL Server driver needed).
+# secure-local-storage adds keyring so the SSO id-token is cached -> one login popup.
+snowflake-connector-python[pandas,secure-local-storage]>=3.12
+PyMySQL>=1.1
