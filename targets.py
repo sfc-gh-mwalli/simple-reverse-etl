@@ -74,14 +74,21 @@ class MySQLTarget:
         LOAD DATA LOCAL INFILE. `mode='upsert'` uses REPLACE (row with the same
         primary key is replaced); otherwise plain append (caller truncates first).
         Far faster than row-by-row executemany for large files.
+
+        Each field is read into a user variable, then NULLIF turns the unload
+        sentinel '__NULL__' back into a real NULL (empty strings stay ''). The
+        sentinel must match NULL_IF in snowflake_source.unload_to_stage.
         """
         verb = "REPLACE" if mode == "upsert" else ""
-        collist = ", ".join(f"`{c}`" for c in columns)
+        variables = [f"@v{i}" for i in range(len(columns))]
+        set_clause = ", ".join(
+            f"`{c}` = NULLIF({v}, '__NULL__')" for c, v in zip(columns, variables)
+        )
         sql = (
             f"LOAD DATA LOCAL INFILE %s {verb} INTO TABLE {table} "
             "FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '\"' "
             "LINES TERMINATED BY '\\n' IGNORE 1 LINES "
-            f"({collist})"
+            f"({', '.join(variables)}) SET {set_clause}"
         )
         with self.conn.cursor() as cur:
             cur.execute(sql, (csv_path,))

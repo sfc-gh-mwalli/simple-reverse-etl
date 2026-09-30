@@ -119,9 +119,13 @@ def build_hwm_query(source: str, hwm_col: str) -> str:
 def consume_stream_to_outbox(conn, stream: str, outbox: str) -> int:
     """Consume the stream into the outbox. Committing this INSERT is what
     advances the stream offset. Returns the number of change rows captured."""
+    # A stream's `*` yields the source columns plus METADATA$ACTION,
+    # METADATA$ISUPDATE and METADATA$ROW_ID. We keep ACTION/ISUPDATE (they map
+    # positionally to the outbox's _CDC_ACTION/_CDC_ISUPDATE) but EXCLUDE
+    # METADATA$ROW_ID, then append the load timestamp and export flag.
     sql = (
         f"INSERT INTO {outbox} "
-        f"SELECT s.*, METADATA$ACTION, METADATA$ISUPDATE, CURRENT_TIMESTAMP(), FALSE "
+        f"SELECT s.* EXCLUDE (METADATA$ROW_ID), CURRENT_TIMESTAMP(), FALSE "
         f"FROM {stream} AS s"
     )
     cur = conn.cursor()
@@ -186,12 +190,16 @@ def unload_to_stage(conn, query: str, stage_path: str, params=None) -> int:
     (e.g. '@my_stage/claims/'). Returns the number of rows unloaded.
 
     HEADER=TRUE writes a header row (the bulk loader skips it). OVERWRITE=TRUE
-    keeps re-runs idempotent for the demo.
+    keeps re-runs idempotent. SQL NULL is written as the literal token '__NULL__'
+    (with EMPTY_FIELD_AS_NULL=FALSE so real empty strings stay distinct); the
+    bulk loader turns that token back into NULL. The '__NULL__' sentinel must
+    match the one in targets.MySQLTarget.bulk_load.
     """
     sql = (
         f"COPY INTO {stage_path} FROM ({query}) "
         "FILE_FORMAT = (TYPE = CSV COMPRESSION = GZIP "
-        "FIELD_OPTIONALLY_ENCLOSED_BY = '\"' NULL_IF = ('')) "
+        "FIELD_OPTIONALLY_ENCLOSED_BY = '\"' NULL_IF = ('__NULL__') "
+        "EMPTY_FIELD_AS_NULL = FALSE) "
         "HEADER = TRUE OVERWRITE = TRUE MAX_FILE_SIZE = 100000000"
     )
     cur = conn.cursor()

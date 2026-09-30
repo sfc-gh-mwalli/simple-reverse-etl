@@ -41,9 +41,11 @@ CREATE TABLE IF NOT EXISTS ANALYTICS.DENTAL.CLAIMS_OUTBOX (
 -- The job runs the consume step itself (shown here for reference):
 --
 --   INSERT INTO ANALYTICS.DENTAL.CLAIMS_OUTBOX
---   SELECT s.*, METADATA$ACTION, METADATA$ISUPDATE, CURRENT_TIMESTAMP(), FALSE
+--   SELECT s.* EXCLUDE (METADATA$ROW_ID), CURRENT_TIMESTAMP(), FALSE
 --   FROM ANALYTICS.DENTAL.CLAIMS_STREAM AS s;
 --
+-- (A stream's * includes METADATA$ACTION, METADATA$ISUPDATE and METADATA$ROW_ID;
+--  the first two map to the outbox's _CDC_ACTION/_CDC_ISUPDATE, ROW_ID is dropped.)
 -- ...committing that INSERT is what advances the stream offset.
 
 -- ----------------------------------------------------------------------------
