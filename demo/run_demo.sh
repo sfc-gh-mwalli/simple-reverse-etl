@@ -93,14 +93,16 @@ echo "Do the two tables match? (expect match=1)"
           WHERE c.CLAIM_STATUS=s.CLAIM_STATUS AND c.AMOUNT=s.AMOUNT)
       THEN 1 ELSE 0 END AS match_;" || true
 
-banner "When to use which"
+banner "Choosing a transport"
 cat <<'TXT'
-  Transport A (connector pull):  simplest, fewest moving parts, great for deltas
-                                 and modest volume. Holds a Snowflake session
-                                 during the load; row-batched writes.
-  Transport B (unload + bulk):   parallel compressed unload + native bulk load;
-                                 best for large full loads (30-60M+). Decoupled
-                                 and restartable; on-prem only needs the stage.
+  Transport A (connector pull):  fewest components; suited to incremental deltas
+                                 and moderate volumes. Uses a Snowflake session
+                                 for the duration of the load; batched DML writes.
+  Transport B (unload + bulk):   compressed unload and native bulk load; suited to
+                                 large full or incremental loads. The load is
+                                 decoupled from Snowflake and can be retried from
+                                 the retrieved files.
+  Network requirements for each option are described in README.md.
 TXT
 
 banner "Done"

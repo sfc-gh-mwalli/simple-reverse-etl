@@ -7,7 +7,7 @@ services:
       MYSQL_ROOT_PASSWORD: demopw
       MYSQL_DATABASE: DENTAL_RPT
     ports:
-      - "3306:3306"
+      - "127.0.0.1:3306:3306"
     volumes:
       - ./mysql_init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
     healthcheck:

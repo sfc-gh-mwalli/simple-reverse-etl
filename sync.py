@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Read from Snowflake, write to MySQL / SQL Server. On-prem, batch, Airflow-friendly.
 
-This is the reverse of the Snowpark DB-API (which reads external -> Snowflake).
-Here the job runs ON-PREM and makes only OUTBOUND connections: out to Snowflake
+The job runs ON-PREM and makes only OUTBOUND connections: out to Snowflake
 to read, and to the local RDBMS to write. Nothing has to reach INTO the on-prem
 data center, which is the connectivity constraint that matters on locked-down
 enterprise networks.
