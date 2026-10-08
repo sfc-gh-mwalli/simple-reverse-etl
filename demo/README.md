@@ -1,10 +1,11 @@
 # SimpleReverseETL demonstration runbook
 
 This runbook is a presenter script for demonstrating both SimpleReverseETL transports and
-both incremental change-capture methods. For each transport it shows the source data in
-Snowflake, walks through the relevant code, runs a full load and an incremental load into
-MySQL, and shows the result in TablePlus. For Transport B it also shows the unloaded files
-on the stage. A final part shows stream-based change capture, including deletes.
+both incremental change-capture methods, against either a MySQL or a SQL Server target.
+For each transport it shows the source data in Snowflake, walks through the relevant
+code, runs a full load and an incremental load, and shows the result in TablePlus. For
+Transport B it also shows the unloaded files on the stage. A final part shows
+stream-based change capture, including deletes.
 
 For architecture, network requirements, and production guidance, see the
 [top-level README](../README.md). For an unattended run of the whole sequence, use
@@ -40,16 +41,21 @@ Part 5 (stream-based change capture). Part 5 can be skipped.
    cp demo/.env.demo.example demo/.env.demo
    ```
 
-3. **TablePlus.** Install TablePlus (`brew install --cask tableplus`) and create a MySQL
-   connection named **SimpleReverseETL Demo**:
+3. **TablePlus.** Install TablePlus (`brew install --cask tableplus`) and create a
+   connection for the target you will present (or both):
 
-   | Field | Value |
-   |---|---|
-   | Host | `127.0.0.1` |
-   | Port | `3306` |
-   | User | `root` |
-   | Password | `demopw` |
-   | Database | `DENTAL_RPT` |
+   | Field | MySQL | SQL Server |
+   |---|---|---|
+   | Connection type | MySQL | Microsoft SQL Server |
+   | Name | SimpleReverseETL MySQL | SimpleReverseETL SQL Server |
+   | Host | `127.0.0.1` | `127.0.0.1` |
+   | Port | `3306` | `1433` |
+   | User | `root` | `sa` |
+   | Password | `demopw` | `Demo_Passw0rd` |
+   | Database | `DENTAL_RPT` | `DENTAL_RPT` (tables are in schema `dbo`) |
+
+   The target container must be running for the connection test to succeed; the reset
+   step below starts it.
 
 4. **Snowsight.** Open a new SQL worksheet, paste in the contents of
    [demo/snowsight_demo.sql](snowsight_demo.sql), and set the worksheet role and warehouse
@@ -99,15 +105,15 @@ All commands in Parts 1 to 5 are identical for both targets.
   [SQL Server targets](../README.md#sql-server-targets)). The first start downloads the
   `mcr.microsoft.com/mssql/server:2022-latest` image and accepts the SQL Server Developer
   edition license. On Apple silicon the image runs under emulation.
-- **TablePlus.** Create a **Microsoft SQL Server** connection named
-  **SimpleReverseETL SQL Server**: host `127.0.0.1`, port `1433`, user `sa`, password
-  `Demo_Passw0rd`, database `DENTAL_RPT`. The tables are in the `dbo` schema.
+- **TablePlus.** Use the SQL Server connection from preparation step 3.
 - **Transport B load method.** By default SQL Server reads the unloaded files itself with
   `BULK INSERT`; the demo mounts `_unload_tmp` into the container at `/var/opt/unload` to
   stand in for a shared folder. To show the client-side method instead, run
   `export TARGET_MSSQL_LOAD_METHOD=client` before `source demo/target_env.sh`.
 - **Log lines.** Transport B additionally logs one line per file, for example
-  `DENTAL_CLAIMS_STAGED: 20 rows from data_0_0_0.csv (bulk_insert)`.
+  `DENTAL_CLAIMS_STAGED: 20 rows from upsert/data_0_0_0.csv (bulk_insert)`.
+- **Startup time.** Under emulation SQL Server can take a minute to accept connections
+  after the container starts. The reset script waits for it.
 
 ---
 
@@ -143,7 +149,8 @@ three are empty.
 | [snowflake_source.py](../snowflake_source.py#L103) `build_hwm_query()` | Selects rows between the last watermark and a ceiling captured before the read, so rows updated during the read are not skipped. |
 | [snowflake_source.py](../snowflake_source.py#L76) `read_query_batches()` | Streams the result as Apache Arrow batches with `fetch_pandas_batches()`. Memory use depends on batch size, not result size. |
 | [transports.py](../transports.py#L45) `pull_apply()` | Transport A: writes each Arrow batch to the target. |
-| [targets.py](../targets.py#L65) `MySQLTarget.write()` | Batched `INSERT ... ON DUPLICATE KEY UPDATE`, which is an upsert on the primary key. The SQL Server writer uses a temporary table and `MERGE`. |
+| [targets.py](../targets.py#L65) `MySQLTarget.write()` | MySQL: batched `INSERT ... ON DUPLICATE KEY UPDATE`, an upsert on the primary key. |
+| [targets.py](../targets.py#L313) `MSSQLTarget.write()` | SQL Server: batched inserts into a session temporary table, then one `MERGE`. |
 | [change_capture.py](../change_capture.py#L13) module docstring, "High-water-mark (hwm) state" | Where the watermark is stored, its format, and the four-step cycle. |
 | [change_capture.py](../change_capture.py#L110) `plan_hwm()` | The four steps in code: read the saved watermark, read the ceiling, load and commit, and only then save the new watermark. The watermark is saved only after the target commit in [sync.py](../sync.py#L138) `main()`, so a failed run leaves it unchanged and is retried from the same point. |
 
@@ -163,8 +170,8 @@ python sync.py --source $SRC --target DENTAL_CLAIMS \
 
 ### Show the watermark
 
-The watermark is the largest `UPDATED_AT` value already delivered to MySQL. It is stored
-in a JSON file on the job host, not in Snowflake or MySQL:
+The watermark is the largest `UPDATED_AT` value already delivered to the target. It is stored
+in a JSON file on the job host, not in Snowflake or the target database:
 
 ```bash
 cat sync_state.json
@@ -172,7 +179,7 @@ cat sync_state.json
 
 ```json
 {
-  "SIMPLE_REVERSE_ETL_DEMO.DENTAL.DENTAL_CLAIMS": {
+  "SIMPLE_REVERSE_ETL_DEMO.DENTAL.DENTAL_CLAIMS -> DENTAL_CLAIMS": {
     "watermark": "2026-10-08 08:17:10.349000"
   }
 }
@@ -180,9 +187,10 @@ cat sync_state.json
 
 **Talking points**
 
-- The file is keyed by source table, so one file can track many tables.
+- The file is keyed by source and target table (`<source> -> <target>`), so one file can
+  track many source/target pairs, including the same source loaded into two targets.
 - The value matches `LATEST_UPDATE` from `[S1]` in Snowsight.
-- The watermark is written only after the MySQL commit succeeds. If a run fails, the
+- The watermark is written only after the target commit succeeds. If a run fails, the
   watermark does not move and the next run retries the same window.
 - Running the same command again now transfers nothing
   (`No new rows above watermark ...`). Optionally, run it to show this.
@@ -203,7 +211,8 @@ cat sync_state.json
 | [transports.py](../transports.py#L107) `unload_apply()` | Transport B: unload to the stage, retrieve the files, and bulk load. Change capture is the same code as Transport A; only `--transport unload` differs. |
 | [snowflake_source.py](../snowflake_source.py#L245) `unload_to_stage()` | `COPY INTO @stage` writes gzip-compressed CSV files. Snowflake does the export work, in parallel for large results. NULLs are written as a sentinel so they can be told apart from empty strings. |
 | [snowflake_source.py](../snowflake_source.py#L278) `get_files()` | `GET` downloads the files over outbound HTTPS. With an external stage in production, the job reads the bucket with the cloud provider's SDK instead. |
-| [targets.py](../targets.py#L105) `MySQLTarget.bulk_load()` | `LOAD DATA LOCAL INFILE ... REPLACE`, the native MySQL bulk loader, with sentinel values converted back to NULL. The SQL Server version, [`MSSQLTarget.bulk_load()`](../targets.py#L341), uses `BULK INSERT` into a temporary table and `MERGE`. |
+| [targets.py](../targets.py#L105) `MySQLTarget.bulk_load()` | MySQL: `LOAD DATA LOCAL INFILE ... REPLACE`, the native bulk loader, with sentinel values converted back to NULL. |
+| [targets.py](../targets.py#L341) `MSSQLTarget.bulk_load()` | SQL Server: `BULK INSERT` (or client-side batches) into a temporary table, then `MERGE`, with sentinel values converted back to NULL. |
 
 ### Run the initial load
 
@@ -349,8 +358,9 @@ every change since, including the ones made in `[S2]`.
 **Talking points**
 
 - A stream offset advances only when a DML statement that reads the stream commits.
-  Snowflake and the target database cannot share a transaction, so the outbox is the hand-off point: if
-  the target write fails, the changes are still in the outbox and the next run applies them.
+  Snowflake and the target database cannot share a transaction, so the outbox is the
+  hand-off point: if the target write fails, the changes are still in the outbox and the
+  next run applies them.
 - Applying the same change twice gives the same result, so delivery is at-least-once with
   a correct final state.
 
@@ -452,7 +462,8 @@ Optionally, run the stream command once more. It reports `Consumed 0 change rows
 | Best for | Incremental deltas and moderate volumes | Large full or incremental loads |
 | Load method | Batched upsert statements | Native bulk loader |
 | Recovery | Re-query Snowflake | Reload from retrieved files |
-| Change capture | `none`, `hwm`, `stream` | `none`, `hwm` |
+| Change capture | `none`, `hwm`, `stream` | `none`, `hwm`, `stream` |
+| Target load | MySQL `INSERT ... ON DUPLICATE KEY UPDATE`; SQL Server `MERGE` | MySQL `LOAD DATA LOCAL INFILE`; SQL Server `BULK INSERT` |
 | Job host connects to | Snowflake (and stage storage) | Snowflake and stage storage, or only the bucket when Snowflake schedules the unload |
 
 | | Watermark (`hwm`) | Stream |
@@ -480,11 +491,16 @@ Use `SYSTEM$ALLOWLIST()` to get the list of hosts for an account.
 | Snowsight reports that `UNLOAD_STAGE`, `UNLOAD_CSV`, `CLAIMS_STREAM`, or `CLAIMS_OUTBOX` does not exist | Run `./demo/reset_demo.sh`. It creates these objects. |
 | Stream run reports `Consumed 0 change rows` unexpectedly | The changes were already consumed by an earlier run. Run `[S6]` again with a different claim, or reset the demo. |
 | Stream run fails because the stream is stale or its source table was replaced | Run `./demo/reset_demo.sh`, which recreates the source table and the stream together. |
-| TablePlus cannot connect | Use host `127.0.0.1`, not `localhost`, and confirm the container is running with `docker ps`. |
+| TablePlus cannot connect | Use host `127.0.0.1`, not `localhost`, confirm the container is running with `docker ps`, and check that the connection type matches the target (MySQL on 3306, SQL Server on 1433). |
+| SQL Server: `Login failed` or connection refused right after a reset | SQL Server is still starting under emulation. Wait a minute and retry. |
+| SQL Server: `Can't open lib 'ODBC Driver 18 for SQL Server'` or an OpenSSL load error | Install the driver (`brew tap microsoft/mssql-release && brew install msodbcsql18`). On macOS with `openssl@4` installed, point `/opt/homebrew/opt/openssl` at `openssl@3`; see [SQL Server targets](../README.md#sql-server-targets). |
+| SQL Server: `BULK INSERT` cannot open the file | The container must see `_unload_tmp` at `/var/opt/unload`. If `_unload_tmp` was deleted while the container was running, recreate it: `docker compose -f demo/docker-compose.yml --profile mssql up -d --force-recreate mssql`. Or use `TARGET_MSSQL_LOAD_METHOD=client`. |
+| MySQL: `Loading local data is disabled` | The server must run with `local_infile` enabled. The demo container does; run `./demo/reset_demo.sh` to restart it with the demo settings. |
 
 ## Cleanup
 
-After the presentation, stop MySQL and remove its data:
+After the presentation, stop the target containers (MySQL and SQL Server) and remove their
+data, then remove the local state and retrieved files:
 
 ```bash
 docker compose -f demo/docker-compose.yml --profile mssql down -v

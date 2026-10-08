@@ -118,8 +118,10 @@ diagnostics (`enable_connection_diag=True`). Additional points:
   is set, and replaces OCSP checks with optional CRL checks, which changes the endpoints
   above. Pin the connector version in production and review these items before upgrading.
 
-As implemented here, Transport B unloads to the Snowflake user stage and retrieves files
-with `GET`, so its connectivity requirements are the same as Transport A's.
+As implemented here, Transport B unloads to a Snowflake internal stage (by default the
+user stage, `@~/simple_reverse_etl`; any internal named stage can be set with `--stage`)
+and retrieves files with `GET`, so its connectivity requirements are the same as
+Transport A's.
 
 ### Transport B with an external stage
 
@@ -153,7 +155,7 @@ the connectivity profile:
 | Consideration | Transport A — connector pull | Transport B — unload and bulk load |
 |---|---|---|
 | Components | Job, Snowflake, target | Job, Snowflake, stage storage, target |
-| Suitable volumes | Incremental deltas and moderate tables | Large full or incremental loads (tens of millions of rows) |
+| Suitable volumes | Incremental deltas and moderate tables | Large full or incremental loads |
 | Load mechanism | Batched parameterized DML | Native bulk load |
 | Snowflake session | Used for the duration of the load | Used only for unload and retrieval |
 | Recovery | Re-query the source | Re-load from retrieved files |
@@ -360,6 +362,35 @@ watermark or outbox state unchanged. Options that do not apply to the chosen tra
 (for example `--stage` with `pull`, or `--commit-rows` with `unload`) are rejected. Run
 `python sync.py --help` for the full option list.
 
+**Transactions.** Transport B and stream mode apply each run in one target transaction.
+Transport A with `none` or `hwm` commits about every `--commit-rows` rows (default
+100,000) to bound transaction size; after a failure, the next run re-sends the same
+window, which upsert mode makes harmless.
+
+**Column names.** Target columns must have the same names as the source columns.
+Snowflake returns unquoted identifiers in upper case; `--lower-cols` lowercases them for
+targets whose columns are defined in lower case and compared case-sensitively.
+
+### MySQL targets
+
+- **Driver.** `PyMySQL`, connecting with `utf8mb4`. Use `utf8mb4` columns for text that
+  may contain characters outside the Basic Multilingual Plane.
+- **Upserts** use `INSERT ... ON DUPLICATE KEY UPDATE`, which matches on any primary or
+  unique key of the target table.
+- **Transport B** loads with `LOAD DATA LOCAL INFILE`. The job enables it on the client
+  side; the server must also allow it (`local_infile=ON`, off by default in MySQL 8).
+  Upserts use `LOAD DATA ... REPLACE`, which deletes and re-inserts a row whose key
+  already exists. On tables with `ON DELETE` foreign-key actions or delete triggers, use
+  Transport A instead, or adapt the load to a staging table and
+  `INSERT ... ON DUPLICATE KEY UPDATE`.
+- **Stream deletes** with Transport B are applied by loading the keys into a temporary
+  table and joining it in one `DELETE`.
+- **Privileges.** `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on the target tables,
+  `DROP` for `--mode truncate`, and `CREATE TEMPORARY TABLES` for Transport B stream
+  deletes.
+- **Truncate.** `TRUNCATE` commits implicitly on MySQL, so a full load that fails after
+  it leaves the table empty until the next successful run.
+
 ### SQL Server targets
 
 - **Driver.** Install the Microsoft ODBC Driver 18 for SQL Server on the job host. On
@@ -379,6 +410,11 @@ watermark or outbox state unchanged. Options that do not apply to the chosen tra
 - **Certificates.** Connections are encrypted and the server certificate is validated by
   default. Install the server's CA certificate on the job host rather than setting
   `TARGET_MSSQL_TRUST_SERVER_CERT=yes`.
+- **Privileges.** `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on the target tables, and
+  `ALTER` for `--mode truncate`; session temporary tables need no grant. `bulk_insert`
+  additionally needs `ADMINISTER BULK OPERATIONS`, as above.
+- **Truncate** is part of the load transaction, so a failed full load leaves the previous
+  contents in place.
 - **Timestamps** keep their fractional seconds: parameters are bound with explicit
   precision, because `pyodbc` with `fast_executemany` otherwise drops milliseconds.
 - **Unicode.** Text parameters are bound as Unicode, because `pyodbc` otherwise sends
@@ -408,10 +444,11 @@ watermark or outbox state unchanged. Options that do not apply to the chosen tra
   already in use (cron, Airflow, Control-M, and so on). Runs for a given target should not
   overlap.
 - **Target schema.** Target tables must exist before the first run, with column names
-  matching the source projection and a key that supports the chosen upsert.
-- **MySQL truncate.** `TRUNCATE` commits implicitly on MySQL, so a full load that fails
-  after it leaves the table empty until the next successful run. On SQL Server, `TRUNCATE`
-  is part of the load transaction.
+  matching the source projection and a key that supports the chosen upsert. Target
+  privileges are listed under [MySQL targets](#mysql-targets) and
+  [SQL Server targets](#sql-server-targets).
+- **Truncate.** A failed full load leaves a MySQL table empty (`TRUNCATE` commits
+  implicitly) but leaves a SQL Server table unchanged.
 - **Volume.** Prefer incremental change capture over full reloads, and prefer Transport B
   where row-level DML becomes the bottleneck. Transport A read throughput can be increased
   further with `cursor.get_result_batches()` for parallel retrieval.
