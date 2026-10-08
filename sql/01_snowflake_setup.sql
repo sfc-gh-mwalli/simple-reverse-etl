@@ -10,7 +10,8 @@
 -- (a plain SELECT does NOT advance it). We cannot safely advance the offset
 -- before the on-prem write to MySQL/SQL Server has succeeded. So the job:
 --   1. consumes the stream INTO this outbox (offset advances atomically here),
---   2. drains the outbox from on-prem and writes to the target,
+--   2. drains the outbox from on-prem, drops the old-value half of each UPDATE,
+--      keeps the latest change per key, and writes to the target,
 --   3. marks the drained rows exported.
 -- If the on-prem write fails, the changes are still safely in the outbox and
 -- get retried on the next run (at-least-once + idempotent upsert on the key).
@@ -20,12 +21,14 @@
 ALTER TABLE ANALYTICS.DENTAL.CLAIMS SET CHANGE_TRACKING = TRUE;
 
 -- 2. Standard (delta) stream: tracks INSERT / UPDATE / DELETE.
---    Use APPEND_ONLY = TRUE instead if the source is insert-only (faster).
+--    Do not use APPEND_ONLY = TRUE here: an append-only stream does not report
+--    updates or deletes, so they would never reach the target.
 CREATE STREAM IF NOT EXISTS ANALYTICS.DENTAL.CLAIMS_STREAM
   ON TABLE ANALYTICS.DENTAL.CLAIMS;
 
 -- 3. Outbox: source columns + CDC metadata + an export marker.
---    Match the source column list; the three _CDC_* columns are added by the job.
+--    The consume step inserts BY POSITION, so list the source columns in exactly
+--    the same order as the source table, then the four _CDC_* columns last.
 CREATE TABLE IF NOT EXISTS ANALYTICS.DENTAL.CLAIMS_OUTBOX (
     -- <<< source columns here, same names/types as ANALYTICS.DENTAL.CLAIMS >>>
     -- e.g.  CLAIM_ID       NUMBER,
@@ -37,6 +40,10 @@ CREATE TABLE IF NOT EXISTS ANALYTICS.DENTAL.CLAIMS_OUTBOX (
     _CDC_LOADED_AT TIMESTAMP_LTZ, -- when the job consumed it into the outbox
     _CDC_EXPORTED  BOOLEAN DEFAULT FALSE
 );
+
+-- 4. Initial load: after creating the stream, run a full load once:
+--      python sync.py ... --change-capture none --mode truncate
+--    then switch to --change-capture stream for subsequent runs.
 
 -- The job runs the consume step itself (shown here for reference):
 --

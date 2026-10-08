@@ -17,6 +17,7 @@ databases without introducing an additional integration platform.
 - [Network and firewall requirements](#network-and-firewall-requirements)
 - [Choosing a transport](#choosing-a-transport)
 - [Change capture and write semantics](#change-capture-and-write-semantics)
+  - [Stream-based change capture](#stream-based-change-capture)
 - [Configuration](#configuration)
 - [Usage](#usage)
 - [Production considerations](#production-considerations)
@@ -163,20 +164,90 @@ integration pattern.
 
 - `none` — the full source on every run. Typically combined with `--mode truncate`.
 - `hwm` — rows whose monotonic high-water-mark column (for example `UPDATED_AT`) is greater
-  than the last committed value. The watermark is read as `MAX(col)` before extraction and
-  persisted to a local state file only after the target commit succeeds, so a failed run
-  is safely retried.
-- `stream` — Transport A only. Uses a Snowflake
-  [stream](https://docs.snowflake.com/en/user-guide/streams-intro) for sources without a
-  reliable modification timestamp, and captures inserts, updates, and deletes. Because a
-  stream's offset advances only when it is consumed by DML, each run first consumes the
-  stream into an **outbox** table in Snowflake, then drains the outbox to the target, and
-  marks rows exported only after the target commit. Delivery is at-least-once and is made
-  idempotent by the key-based upsert. One-time setup is in
-  [sql/01_snowflake_setup.sql](sql/01_snowflake_setup.sql), which also describes a
-  read-only alternative using the `CHANGES` clause.
+  than the last delivered value (the watermark). Each run reads `MAX(col)` as a ceiling
+  before extraction, loads the rows between the watermark and the ceiling, and records the
+  ceiling as the new watermark only after the target commit succeeds, so a failed run is
+  safely retried. The watermark is stored in a JSON file on the job host (`--state-file`,
+  default `./sync_state.json`), keyed by source table. On the first run, `--hwm-start`
+  sets the starting point; without it, all existing rows are loaded. Keep the state file
+  on durable storage in production, or replace `_load_state`/`_save_state` with a control
+  table or scheduler variable.
+- `stream` — Transport A only. Uses a Snowflake stream instead of a watermark column, and
+  also propagates deletes. See [Stream-based change capture](#stream-based-change-capture).
 
-**Write modes** (`--mode`): `truncate` replaces the target contents; `upsert` merges on
+**Choosing `hwm` or `stream`.**
+
+| Consideration | `hwm` | `stream` |
+|---|---|---|
+| Source requirement | A reliable, monotonically increasing column such as `UPDATED_AT` | None; change tracking is enabled on the table |
+| Inserts and updates | Yes | Yes |
+| Deletes | No; deleted rows remain in the target | Yes |
+| Position stored in | JSON state file on the job host | Stream offset and outbox table in Snowflake |
+| Snowflake objects to create | None | Stream and outbox table |
+| Transports | A and B | A only |
+| Operational risk | Rows updated without changing the column are missed | Stream becomes stale if not consumed within the retention period |
+
+### Stream-based change capture
+
+A Snowflake [stream](https://docs.snowflake.com/en/user-guide/streams-intro) records the
+inserts, updates, and deletes committed to a table after a point in time (its offset).
+Selecting from a stream does not change the offset; the offset advances only when the
+stream is read by a DML statement that commits. The job uses this to make delivery
+reliable across two systems that cannot share a transaction:
+
+1. **Consume.** `INSERT INTO <outbox> SELECT ... FROM <stream>` copies all pending changes
+   into an outbox table in Snowflake, together with the change type, an update flag, and a
+   load timestamp. Committing this statement advances the stream offset; the changes are
+   now held in the outbox.
+2. **Reduce.** The job reads every outbox row not yet marked exported. A stream represents
+   an update as two rows: a `DELETE` with the old values and an `INSERT` with the new
+   values, both with `METADATA$ISUPDATE = TRUE`. The job discards the old-value rows and
+   keeps only the most recent change for each key, so the outbox can safely hold the
+   changes from several consumes.
+3. **Apply.** Remaining inserts are upserted on `--key-cols`, and plain deletes are deleted
+   by key, in one target transaction.
+4. **Acknowledge.** After the target commit, the job marks the outbox rows exported.
+
+If the job fails after step 1, the changes stay in the outbox and are applied on the next
+run. If it fails after step 3 but before step 4, they are applied again. Upserts and
+deletes by key are idempotent, so delivery is at-least-once with a correct final state.
+
+**Setup.** Run once, as described in [sql/01_snowflake_setup.sql](sql/01_snowflake_setup.sql):
+
+- Enable change tracking on the source table. Only the table owner can do this; creating
+  a stream also enables it if the creating role owns the table.
+- Create a stream on the source table. Use a standard stream; an append-only stream does
+  not report updates or deletes.
+- Create the outbox table with the source columns **in the same order**, followed by
+  `_CDC_ACTION`, `_CDC_ISUPDATE`, `_CDC_LOADED_AT`, and `_CDC_EXPORTED`. The consume
+  statement inserts by position.
+- Perform an initial full load (`--change-capture none --mode truncate`) after creating the
+  stream. Changes recorded between stream creation and the full load are applied again on
+  the first stream run, which is harmless.
+
+**Privileges.** The job's role needs `USAGE` on the database and schema, `SELECT` on both
+the stream and its source table, and `SELECT`, `INSERT`, and `UPDATE` on the outbox.
+
+**Operational notes.**
+
+- *Staleness.* A stream becomes stale if it is not consumed within the source table's data
+  retention period, extended up to `MAX_DATA_EXTENSION_TIME_IN_DAYS` (14 days by default).
+  A stale stream cannot be read; it must be recreated and the target fully reloaded.
+  Monitor `STALE_AFTER` in `SHOW STREAMS` and schedule runs well inside that window.
+- *Recreating the source.* Replacing the source table (`CREATE OR REPLACE TABLE`) breaks
+  the stream. Recreate the stream and perform a full load.
+- *Outbox growth.* Exported rows remain in the outbox as an audit trail. Purge them on a
+  schedule, for example `DELETE FROM <outbox> WHERE _CDC_EXPORTED AND _CDC_LOADED_AT <
+  DATEADD('day', -7, CURRENT_TIMESTAMP())`.
+- *Volume.* All pending outbox rows are reduced in memory in one pass. This suits regular
+  deltas; for a large backlog, perform a full load and recreate the stream instead.
+- *Alternative.* The `CHANGES` clause reads change-tracking data between two timestamps
+  without a stream or outbox. Its position must then be tracked by the job, as with `hwm`.
+  An example is included in `sql/01_snowflake_setup.sql`; it is not implemented in the job.
+
+### Write modes
+
+`--mode truncate` replaces the target contents; `--mode upsert` merges on
 `--key-cols`, which must correspond to a primary or unique key on the target.
 
 **NULL handling (Transport B).** SQL `NULL` values are unloaded as an explicit sentinel and
@@ -252,7 +323,8 @@ list.
 
 - **Service identity and privileges.** Run under a dedicated service user and role granted
   the minimum required: `USAGE` on the warehouse, database, and schema and `SELECT` on the
-  source; for stream mode, `SELECT` on the stream and `INSERT`, `SELECT`, and `UPDATE` on the
+  source; for stream mode, `SELECT` on the stream and its source table and `INSERT`,
+  `SELECT`, and `UPDATE` on the
   outbox; for Transport B with a named stage, the appropriate stage privileges.
 - **Secrets.** Do not deploy a populated `.env` file. Supply credentials from an approved
   secret store and prefer key-pair authentication over passwords or long-lived tokens.
@@ -264,10 +336,8 @@ list.
 - **Volume.** Prefer incremental change capture over full reloads, and prefer Transport B
   where row-level DML becomes the bottleneck. Transport A read throughput can be increased
   further with `cursor.get_result_batches()` for parallel retrieval.
-- **Stream retention.** A stream becomes stale if it is not consumed within the source
-  table's data retention period (extended automatically up to
-  `MAX_DATA_EXTENSION_TIME_IN_DAYS`, 14 days by default). Schedule stream-mode runs well
-  inside that window.
+- **Stream retention.** In stream mode, schedule runs well inside the stream's
+  `STALE_AFTER` window; see [Stream-based change capture](#stream-based-change-capture).
 
 ## Known limitations
 

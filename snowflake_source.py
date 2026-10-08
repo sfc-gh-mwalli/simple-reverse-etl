@@ -100,16 +100,19 @@ def build_full_query(source: str) -> str:
     return f"SELECT * FROM {source}"
 
 
-def build_hwm_query(source: str, hwm_col: str) -> str:
+def build_hwm_query(source: str, hwm_col: str, has_watermark: bool = True) -> str:
     """Rows strictly above the last watermark, up to a captured ceiling.
 
     The ceiling (bound with %(ceiling)s at call time) is read first via
     SELECT MAX(hwm_col) so a value that keeps advancing during the read can't
-    cause us to skip late rows.
+    cause us to skip late rows. With has_watermark=False (first run, no saved
+    watermark and no --hwm-start) there is no lower bound: every row up to the
+    ceiling is selected.
     """
+    lower = f"{hwm_col} > %(watermark)s AND " if has_watermark else ""
     return (
         f"SELECT * FROM {source} "
-        f"WHERE {hwm_col} > %(watermark)s AND {hwm_col} <= %(ceiling)s "
+        f"WHERE {lower}{hwm_col} <= %(ceiling)s "
         f"ORDER BY {hwm_col}"
     )
 

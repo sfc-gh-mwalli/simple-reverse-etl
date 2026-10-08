@@ -42,11 +42,17 @@ log = logging.getLogger("unload_sync")
 
 
 def _load_state(path: str) -> dict:
+    """Watermark state: {source_table: {"watermark": value}}; {} if no file yet.
+
+    Same format and semantics as sync.py; see "High-water-mark (hwm) state" in
+    its module docstring. Use a separate --state-file per transport and target.
+    """
     p = Path(path)
     return json.loads(p.read_text()) if p.exists() else {}
 
 
 def _save_state(path: str, state: dict) -> None:
+    """Persist watermark state. Call only after the target commit succeeds."""
     Path(path).write_text(json.dumps(state, indent=2, default=str))
 
 
@@ -72,6 +78,9 @@ def run(args) -> int:
     try:
         # 1. Build the query (full or hwm delta) and unload it to the stage.
         if args.change_capture == "hwm":
+            # Last delivered value: saved state, else --hwm-start, else None (load all).
+            # The ceiling is read before unloading so rows updated mid-run wait
+            # for the next run instead of being skipped.
             state = _load_state(args.state_file)
             last = state.get(args.source, {}).get("watermark", args.hwm_start)
             ceiling = sf.scalar(sf_conn, f"SELECT MAX({args.hwm_col}) FROM {args.source}")
@@ -79,7 +88,8 @@ def run(args) -> int:
                 log.info("No new rows above watermark %r (ceiling %r).", last, ceiling)
                 return 0
             log.info("HWM window: %r < %s <= %r", last, args.hwm_col, ceiling)
-            query = sf.build_hwm_query(args.source, args.hwm_col)
+            query = sf.build_hwm_query(args.source, args.hwm_col,
+                                       has_watermark=last is not None)
             params = {"watermark": last, "ceiling": ceiling}
         else:
             query = sf.build_full_query(args.source)
@@ -140,7 +150,9 @@ def parse_args(argv=None):
     p.add_argument("--key-cols", nargs="*", default=None, help="Primary key column(s) for upsert")
     p.add_argument("--hwm-col", help="Monotonic column for --change-capture hwm")
     p.add_argument("--hwm-start", default=None, help="Initial watermark on first run")
-    p.add_argument("--state-file", default="sync_state.json")
+    p.add_argument("--state-file", default="sync_state.json",
+                   help="JSON file holding the hwm watermark per source table "
+                        "(default: ./sync_state.json; use a different file than sync.py)")
     p.add_argument("--stage", default="@~/simple_reverse_etl",
                    help="Stage prefix to unload into (default: your user stage @~)")
     p.add_argument("--local-dir", default="_unload_tmp", help="Local dir for pulled files")

@@ -15,6 +15,26 @@ Write modes:
   truncate  wipe target then load        (full refresh)
   upsert    MERGE / ON DUPLICATE KEY      (needs --key-cols)
 
+High-water-mark (hwm) state
+---------------------------
+The watermark is the largest <hwm-col> value already delivered to the target.
+It is kept in a small JSON file on the job host (--state-file, default
+./sync_state.json), keyed by source table so one file can track many tables:
+
+  {"ANALYTICS.DENTAL.CLAIMS": {"watermark": "2026-10-08 15:09:23.237000"}}
+
+Each run: (1) read the saved watermark, falling back to --hwm-start, or to
+"no lower bound" if neither exists; (2) read MAX(<hwm-col>) from Snowflake as
+the ceiling; (3) load rows with watermark < <hwm-col> <= ceiling; (4) write the
+ceiling back to the file only after the target commit succeeds. A failed run
+therefore leaves the watermark unchanged and the next run retries the same
+window. Large loads commit every --commit-rows rows, so a retry can re-send rows
+that were already committed; upsert mode makes that harmless.
+
+The file is local to one host. In production, keep it on durable storage, or
+replace _load_state/_save_state with a control table or scheduler variable.
+Deleting the file (or changing --state-file) causes a reload from --hwm-start.
+
 Examples
 --------
   # Full refresh of a small dimension into MySQL
@@ -60,11 +80,13 @@ def _df_to_rows(df: pd.DataFrame):
 
 
 def _load_state(path: str) -> dict:
+    """Watermark state: {source_table: {"watermark": value}}; {} if no file yet."""
     p = Path(path)
     return json.loads(p.read_text()) if p.exists() else {}
 
 
 def _save_state(path: str, state: dict) -> None:
+    """Persist watermark state. Call only after the target commit succeeds."""
     Path(path).write_text(json.dumps(state, indent=2, default=str))
 
 
@@ -99,48 +121,69 @@ def run_full(sf_conn, target, args):
 
 
 def run_hwm(sf_conn, target, args):
+    """Incremental load of rows whose <hwm-col> advanced since the last run.
+
+    See "High-water-mark (hwm) state" in the module docstring.
+    """
+    # 1. Last delivered value: saved state, else --hwm-start, else None (load all).
     state = _load_state(args.state_file)
     last = state.get(args.source, {}).get("watermark", args.hwm_start)
+    # 2. Ceiling captured before reading, so rows updated mid-read wait for next run.
     ceiling = sf.scalar(sf_conn, f"SELECT MAX({args.hwm_col}) FROM {args.source}")
     if ceiling is None or (last is not None and str(ceiling) <= str(last)):
         log.info("No new rows above watermark %r (ceiling %r).", last, ceiling)
         return
     log.info("HWM window: %r < %s <= %r", last, args.hwm_col, ceiling)
+    # 3. Read the window and write it to the target (_write_frames commits).
     frames = sf.read_query_batches(
         sf_conn,
-        sf.build_hwm_query(args.source, args.hwm_col),
+        sf.build_hwm_query(args.source, args.hwm_col, has_watermark=last is not None),
         params={"watermark": last, "ceiling": ceiling},
     )
     n = _write_frames(target, frames, args.target, None,
                       args.mode, args.key_cols, args.commit_rows)
+    # 4. Advance the watermark only now that the target has committed.
     state.setdefault(args.source, {})["watermark"] = ceiling
     _save_state(args.state_file, state)
     log.info("HWM load complete: %s rows, watermark advanced to %r", n, ceiling)
 
 
 def run_stream(sf_conn, target, args):
+    if not args.key_cols:
+        raise SystemExit("--change-capture stream requires --key-cols")
+
     # 1. Consume the stream into the outbox (this commit advances the offset).
     sf.consume_stream_to_outbox(sf_conn, args.stream, args.outbox)
 
-    # 2. Drain un-exported outbox rows, splitting deletes from upserts by the
-    #    CDC action. An UPDATE arrives as a DELETE+INSERT pair; the INSERT half
-    #    carries the new row, so upserting the INSERT rows is sufficient.
+    # 2. Drain un-exported outbox rows and reduce them to one change per key.
+    #    A stream reports an UPDATE as a DELETE row (old values) plus an INSERT
+    #    row (new values), both with METADATA$ISUPDATE = TRUE. Drop the DELETE
+    #    half so old values are never written. The outbox can hold several
+    #    consumes (e.g. after a failed run), so keep only the latest change per
+    #    key: an INSERT becomes an upsert, a plain DELETE becomes a delete. This
+    #    also guarantees unique keys per batch, which SQL Server's MERGE requires.
     frames = list(sf.read_outbox_batches(sf_conn, args.outbox))
     total = deletes = 0
-    for df in frames:
+    if frames:
+        df = pd.concat(frames, ignore_index=True)
+        is_update_before = (df["_CDC_ACTION"] == "DELETE") & df["_CDC_ISUPDATE"].astype(bool)
+        df = df.loc[~is_update_before]
+        df = (df.sort_values("_CDC_LOADED_AT", kind="stable")
+                .drop_duplicates(subset=list(args.key_cols), keep="last"))
+
         data_cols = [c for c in df.columns if c not in CDC_META]
-        is_del = (df["_CDC_ACTION"] == "DELETE") & (~df["_CDC_ISUPDATE"].astype(bool))
+        is_del = df["_CDC_ACTION"] == "DELETE"
         upserts = df.loc[~is_del, data_cols]
         removes = df.loc[is_del, data_cols]
 
         if not upserts.empty:
             target.write(args.target, data_cols, _df_to_rows(upserts),
                          mode="upsert", key_columns=args.key_cols)
-            total += len(upserts)
-        if args.key_cols and not removes.empty:
+            total = len(upserts)
+        if not removes.empty:
             key_rows = _df_to_rows(removes[list(args.key_cols)])
             target.delete(args.target, args.key_cols, key_rows)
-            deletes += len(removes)
+            deletes = len(removes)
     target.commit()
 
     # 3. Only now is the target write durable -> mark the rows exported.
@@ -166,7 +209,9 @@ def parse_args(argv=None):
     p.add_argument("--hwm-col", help="Monotonic column for --change-capture hwm")
     p.add_argument("--hwm-start", default=None,
                    help="Initial watermark when the state file has none")
-    p.add_argument("--state-file", default="sync_state.json")
+    p.add_argument("--state-file", default="sync_state.json",
+                   help="JSON file holding the hwm watermark per source table "
+                        "(default: ./sync_state.json)")
     p.add_argument("--stream", help="Stream name for --change-capture stream")
     p.add_argument("--outbox", help="Outbox table for --change-capture stream")
     p.add_argument("--commit-rows", type=int, default=100_000,
