@@ -66,7 +66,10 @@ demo_init_target() {
     if [ "$DEMO_TARGET" = mysql ]; then
         "$DEMO/target_query.sh" "$(cat "$DEMO/mysql_init.sql")" >/dev/null
     else
+        # Piped in rather than bind-mounted: a single-file mount keeps pointing
+        # at the old file after an editor replaces it.
         "${COMPOSE[@]}" exec -T mssql /opt/mssql-tools18/bin/sqlcmd \
-            -S localhost -U sa -P "$TARGET_PASSWORD" -C -b -i /demo/mssql_init.sql >/dev/null
+            -S localhost -U sa -P "$TARGET_PASSWORD" -C -b -i /dev/stdin \
+            < "$DEMO/mssql_init.sql" >/dev/null
     fi
 }

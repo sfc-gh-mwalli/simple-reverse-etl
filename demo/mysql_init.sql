@@ -5,7 +5,7 @@
 --
 -- Three identical tables so the demo can show each path side by side:
 --   DENTAL_CLAIMS         <- Transport A, hwm change capture (sync.py)
---   DENTAL_CLAIMS_STAGED  <- Transport B (unload -> stage -> bulk load, unload_sync.py)
+--   DENTAL_CLAIMS_STAGED  <- Transport B (unload -> stage -> bulk load, sync.py --transport unload)
 --   DENTAL_CLAIMS_CDC     <- Transport A, stream change capture (sync.py)
 --
 -- demo/reset_demo.sh also applies this file, so new tables appear in an

@@ -3,9 +3,9 @@
 # Unattended end-to-end demo: Snowflake -> local MySQL or SQL Server.
 #   Source: SIMPLE_REVERSE_ETL_DEMO.DENTAL.DENTAL_CLAIMS
 #
-#   Transport A - connector pull, hwm             (sync.py)        -> DENTAL_CLAIMS
-#   Transport B - unload -> stage -> bulk load    (unload_sync.py) -> DENTAL_CLAIMS_STAGED
-#   Stream CDC  - Transport A, then Transport B   (both)           -> DENTAL_CLAIMS_CDC
+#   Transport A - connector pull, hwm           sync.py                     -> DENTAL_CLAIMS
+#   Transport B - unload -> stage -> bulk load  sync.py --transport unload  -> DENTAL_CLAIMS_STAGED
+#   Stream CDC  - Transport A, then B           both                        -> DENTAL_CLAIMS_CDC
 #
 # Watermark part: a full load (20 rows), then after 2 updates + 3 inserts a delta
 # upsert (-> 23 rows) with each transport; both tables must end identical.
@@ -44,7 +44,7 @@ cd "$ROOT"
 A_HWM=(python sync.py --source "$SRC" --target DENTAL_CLAIMS
        --change-capture hwm --hwm-col UPDATED_AT --mode upsert --key-cols CLAIM_ID
        --state-file "$STATE_A")
-B_HWM=(python unload_sync.py --source "$SRC" --target DENTAL_CLAIMS_STAGED
+B_HWM=(python sync.py --transport unload --source "$SRC" --target DENTAL_CLAIMS_STAGED
        --change-capture hwm --hwm-col UPDATED_AT --mode upsert --key-cols CLAIM_ID
        --stage "$STAGE" --state-file "$STATE_B" --local-dir _unload_tmp)
 STREAM_ARGS=(--source "$SRC" --target DENTAL_CLAIMS_CDC --change-capture stream
@@ -85,7 +85,7 @@ python sync.py "${STREAM_ARGS[@]}"
 
 banner "5. Delete claim 5, update claim 3; apply via the stream with Transport B"
 python "$DEMO/sf_exec.py" --file "$DEMO/mutate_snowflake_cdc.sql"
-python unload_sync.py "${STREAM_ARGS[@]}" --stage "$STAGE" --local-dir _unload_tmp
+python sync.py --transport unload "${STREAM_ARGS[@]}" --stage "$STAGE" --local-dir _unload_tmp
 "$Q" "SELECT CLAIM_ID, CLAIM_STATUS, AMOUNT FROM DENTAL_CLAIMS_CDC
       WHERE CLAIM_ID IN (3,4,5,6) ORDER BY CLAIM_ID;"
 SF_ROWS="$(python "$DEMO/sf_exec.py" --scalar "SELECT COUNT(*) FROM $SRC")"
@@ -94,6 +94,9 @@ HAS5="$(count "DENTAL_CLAIMS_CDC WHERE CLAIM_ID = 5")"
 echo "Snowflake rows = $SF_ROWS, DENTAL_CLAIMS_CDC rows = $CDC_ROWS, claim 5 present = $HAS5"
 [ "$CDC_ROWS" = "$SF_ROWS" ] && [ "$CDC_ROWS" = 22 ] && [ "$HAS5" = 0 ] \
     || fail "stream target does not match Snowflake"
+OUTBOX_ROWS="$(python "$DEMO/sf_exec.py" --scalar "SELECT COUNT(*) FROM $OUTBOX")"
+echo "Outbox rows after delivery = $OUTBOX_ROWS (default: delivered rows are deleted)"
+[ "$OUTBOX_ROWS" = 0 ] || fail "outbox still holds delivered rows"
 
 banner "Choosing a transport"
 cat <<'TXT'

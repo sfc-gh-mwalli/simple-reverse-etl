@@ -198,14 +198,36 @@ def mark_outbox_exported(conn, outbox: str, cutoff: str) -> int:
         cur.close()
 
 
+def purge_outbox(conn, outbox: str, retention_days: int) -> int:
+    """Delete delivered (exported) outbox rows loaded more than `retention_days`
+    days ago; 0 deletes every delivered row. Un-delivered rows are never touched,
+    so changes from a failed run stay in the outbox for the next run."""
+    days = int(retention_days)
+    if days < 0:
+        raise ValueError("retention_days must be >= 0")
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            f"DELETE FROM {outbox} WHERE _CDC_EXPORTED "
+            f"AND _CDC_LOADED_AT <= DATEADD('day', -{days}, CURRENT_TIMESTAMP())"
+        )
+        purged = cur.rowcount or 0
+        log.info("Purged %s delivered row(s) from %s (retention %s day(s))",
+                 purged, outbox, days)
+        return purged
+    finally:
+        cur.close()
+
+
 # --- Transport B: unload to a stage, then pull files on-prem -----------------
 #
 # Instead of streaming rows over a live connection (Transport A), Transport B
 # tells Snowflake to write the query result to files in a *stage*, then the
 # on-prem job pulls those files down and bulk-loads them locally. Advantages at
 # large volume: the unload is massively parallel and produces compressed files,
-# the load uses the target's native bulk path, and on-prem only needs to reach
-# the stage/bucket -- not Snowflake directly.
+# and the load uses the target's native bulk path. As implemented, the job still
+# connects to Snowflake to run COPY INTO and GET (see README.md, "Network and
+# firewall requirements").
 #
 # DEMO uses an INTERNAL named stage (self-contained, no cloud credentials).
 # PRODUCTION would use an EXTERNAL stage over object storage that on-prem can

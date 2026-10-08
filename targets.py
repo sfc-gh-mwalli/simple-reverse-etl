@@ -1,7 +1,7 @@
 """Pluggable target writers: MySQL and SQL Server.
 
-Each writer exposes the same small contract so sync.py and unload_sync.py don't
-care which RDBMS they're talking to:
+Each writer exposes the same small contract so the transports (transports.py)
+don't care which RDBMS they're talking to:
 
     w = make_target(cfg)
     w.truncate(table)                                    # full-refresh mode
@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import csv
 import logging
+import os
+import shutil
 from typing import Sequence
 
 log = logging.getLogger(__name__)
@@ -173,10 +175,6 @@ class MSSQLTarget:
         self.conn = pyodbc.connect(conn_str, autocommit=False)
         self.load_method = cfg.mssql_load_method
         self.bulk_dir = cfg.mssql_bulk_dir
-        # BULK INSERT needs CODEPAGE='65001' to read UTF-8 files on Windows; SQL
-        # Server on Linux rejects the option and reads UTF-8 by default.
-        self.on_windows = "on Linux" not in self.conn.execute(
-            "SELECT @@VERSION").fetchone()[0]
         if self.load_method == "bulk_insert" and not self.bulk_dir:
             log.info("TARGET_MSSQL_BULK_DIR is not set; Transport B loads will fail "
                      "with load method bulk_insert")
@@ -190,17 +188,29 @@ class MSSQLTarget:
 
     @staticmethod
     def _bind_types(cur, rows) -> None:
-        """Declare timestamp parameters with 7 fractional digits. Without this,
-        fast_executemany binds Python datetimes with zero fractional digits and
-        SQL Server silently drops milliseconds."""
+        """Declare parameter types that fast_executemany would otherwise get wrong:
+
+        - timestamps: 7 fractional digits. Without this, Python datetimes are
+          bound with zero fractional digits and SQL Server drops milliseconds.
+        - strings: Unicode (SQL_WVARCHAR). Without this, strings bound to
+          NVARCHAR(MAX) columns are sent as non-Unicode and characters outside
+          the server code page (for example CJK) become '?'.
+        """
         import datetime
         import pyodbc
 
         sizes = []
         for i in range(len(rows[0])):
-            sample = next((r[i] for r in rows if r[i] is not None), None)
-            is_ts = isinstance(sample, datetime.datetime)
-            sizes.append((pyodbc.SQL_TYPE_TIMESTAMP, 0, 7) if is_ts else None)
+            values = [r[i] for r in rows if r[i] is not None]
+            sample = values[0] if values else None
+            if isinstance(sample, datetime.datetime):
+                sizes.append((pyodbc.SQL_TYPE_TIMESTAMP, 0, 7))
+            elif isinstance(sample, str):
+                longest = max(len(v) for v in values if isinstance(v, str))
+                # 0 means NVARCHAR(MAX); a bounded size keeps the fast path.
+                sizes.append((pyodbc.SQL_WVARCHAR, max(longest, 1) if longest <= 4000 else 0, 0))
+            else:
+                sizes.append(None)
         if any(sizes):
             cur.setinputsizes(sizes)
 
@@ -229,17 +239,30 @@ class MSSQLTarget:
     def _fill_from_csv(self, cur, temp: str, columns, csv_path, rel_path) -> int:
         """Load a header CSV into #temp with BULK INSERT or client-side batches."""
         if self.load_method == "bulk_insert":
-            path = self._server_path(csv_path, rel_path).replace("'", "''")
-            codepage = ", CODEPAGE = '65001'" if self.on_windows else ""
+            # BULK INSERT does not reliably read UTF-8 (SQL Server on Linux rejects
+            # CODEPAGE and assumes a legacy code page), but reads UTF-16 on every
+            # platform with DATAFILETYPE='widechar'. Convert next to the original,
+            # in the same folder SQL Server reads.
+            wide_path = csv_path + ".utf16"
+            with open(csv_path, encoding="utf-8", newline="") as src, \
+                 open(wide_path, "w", encoding="utf-16", newline="") as dst:
+                shutil.copyfileobj(src, dst, 1 << 20)
+            wide_rel = (rel_path or os.path.basename(csv_path)) + ".utf16"
+            path = self._server_path(wide_path, wide_rel).replace("'", "''")
             cur.execute(
                 f"BULK INSERT {temp} FROM '{path}' WITH ("
                 "FORMAT = 'CSV', FIELDQUOTE = '\"', FIRSTROW = 2, "
-                f"FIELDTERMINATOR = ',', ROWTERMINATOR = '0x0a'{codepage}, TABLOCK)"
+                "DATAFILETYPE = 'widechar', FIELDTERMINATOR = ',', ROWTERMINATOR = '\\n', TABLOCK)"
             )
             return cur.rowcount
         cols = ", ".join(_q(c) for c in columns)
         sql = f"INSERT INTO {temp} ({cols}) VALUES ({', '.join('?' * len(columns))})"
         total = 0
+
+        def send(batch):
+            self._bind_types(cur, batch)
+            cur.executemany(sql, batch)
+
         with open(csv_path, newline="", encoding="utf-8") as fh:
             reader = csv.reader(fh)
             next(reader)  # header
@@ -247,13 +270,26 @@ class MSSQLTarget:
             for row in reader:
                 batch.append(row)
                 if len(batch) >= self.CLIENT_BATCH_ROWS:
-                    cur.executemany(sql, batch)
+                    send(batch)
                     total += len(batch)
                     batch = []
             if batch:
-                cur.executemany(sql, batch)
+                send(batch)
                 total += len(batch)
         return total
+
+    def _text_to_value(self, col: str) -> str:
+        """SQL expression turning a #sre_load text column back into its value.
+
+        SQL NULL arrives as NULL_TOKEN. BULK INSERT also loads a quoted empty
+        string ("") as NULL, so with that method a NULL in #sre_load can only be
+        an empty string; the client method reads "" as ''.
+        """
+        c = _q(col)
+        if self.load_method == "bulk_insert":
+            return (f"CASE WHEN {c} IS NULL THEN N'' "
+                    f"WHEN {c} = N'{NULL_TOKEN}' THEN NULL ELSE {c} END")
+        return f"NULLIF({c}, N'{NULL_TOKEN}')"
 
     def _merge_sql(self, table, source, columns, key_columns) -> str:
         on = " AND ".join(f"t.{_q(k)} = s.{_q(k)}" for k in key_columns)
@@ -306,12 +342,13 @@ class MSSQLTarget:
                   rel_path=None) -> None:
         """Transport B load. The CSV is loaded as text into #sre_load (BULK INSERT,
         or client-side batches with TARGET_MSSQL_LOAD_METHOD=client), then
-        NULL_TOKEN is converted to NULL and SQL Server converts the text to the
-        target column types during the MERGE (upsert) or INSERT ... SELECT."""
+        NULL_TOKEN is converted to NULL (see _text_to_value) and SQL Server
+        converts the text to the target column types during the MERGE (upsert)
+        or INSERT ... SELECT."""
         cur = self._cursor(fast=True)
         self._text_temp(cur, "#sre_load", columns)
         n = self._fill_from_csv(cur, "#sre_load", columns, csv_path, rel_path)
-        select = ", ".join(f"NULLIF({_q(c)}, N'{NULL_TOKEN}') AS {_q(c)}" for c in columns)
+        select = ", ".join(f"{self._text_to_value(c)} AS {_q(c)}" for c in columns)
         source = f"(SELECT {select} FROM #sre_load)"
         if mode == "upsert":
             cur.execute(self._merge_sql(table, source, columns, key_columns))

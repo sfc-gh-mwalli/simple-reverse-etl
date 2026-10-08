@@ -32,7 +32,6 @@ services:
     ports:
       - "127.0.0.1:1433:1433"
     volumes:
-      - ./mssql_init.sql:/demo/mssql_init.sql:ro
       # Transport B --local-dir, visible to SQL Server for BULK INSERT
       # (TARGET_MSSQL_BULK_DIR=/var/opt/unload). In production this is a share.
       - ../_unload_tmp:/var/opt/unload:ro

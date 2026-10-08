@@ -10,11 +10,13 @@
 -- (a plain SELECT does NOT advance it). We cannot safely advance the offset
 -- before the on-prem write to MySQL/SQL Server has succeeded. So the job:
 --   1. consumes the stream INTO this outbox (offset advances atomically here),
---   2. drains the outbox from on-prem, drops the old-value half of each UPDATE,
---      keeps the latest change per key, and writes to the target,
---   3. marks the drained rows exported.
+--   2. reads the net change per key from the outbox (the old-value half of each
+--      UPDATE dropped, latest change per key kept) and writes it to the target,
+--   3. after the target commit, marks those rows exported and deletes delivered
+--      rows (immediately by default; --outbox-retention-days N keeps N days).
 -- If the on-prem write fails, the changes are still safely in the outbox and
 -- get retried on the next run (at-least-once + idempotent upsert on the key).
+-- With the default, the outbox only ever holds changes not yet delivered.
 -- ============================================================================
 
 -- 1. Enable change tracking on the source (a stream also enables it implicitly).
@@ -29,7 +31,17 @@ CREATE STREAM IF NOT EXISTS ANALYTICS.DENTAL.CLAIMS_STREAM
 -- 3. Outbox: source columns + CDC metadata + an export marker.
 --    The consume step inserts BY POSITION, so list the source columns in exactly
 --    the same order as the source table, then the four _CDC_* columns last.
-CREATE TABLE IF NOT EXISTS ANALYTICS.DENTAL.CLAIMS_OUTBOX (
+--
+--    TRANSIENT: the outbox is short-lived working data, not a system of record,
+--    so it skips Fail-safe storage. One day of Time Travel still allows UNDROP
+--    after an accident. If the outbox is lost, recover by recreating the stream
+--    and running a full load. Use a permanent table instead only if delivered
+--    rows are kept (--outbox-retention-days) as an audit trail.
+--    An existing permanent outbox can be recreated as transient once it has no
+--    un-exported rows (SELECT COUNT_IF(NOT _CDC_EXPORTED) FROM <outbox> = 0).
+--
+--    Privileges for the job's role: SELECT, INSERT, UPDATE, DELETE.
+CREATE TRANSIENT TABLE IF NOT EXISTS ANALYTICS.DENTAL.CLAIMS_OUTBOX (
     -- <<< source columns here, same names/types as ANALYTICS.DENTAL.CLAIMS >>>
     -- e.g.  CLAIM_ID       NUMBER,
     --       MEMBER_ID      NUMBER,
@@ -39,7 +51,8 @@ CREATE TABLE IF NOT EXISTS ANALYTICS.DENTAL.CLAIMS_OUTBOX (
     _CDC_ISUPDATE  BOOLEAN,       -- TRUE => this row is one half of an UPDATE
     _CDC_LOADED_AT TIMESTAMP_LTZ, -- when the job consumed it into the outbox
     _CDC_EXPORTED  BOOLEAN DEFAULT FALSE
-);
+)
+DATA_RETENTION_TIME_IN_DAYS = 1;
 
 -- 4. Initial load: after creating the stream, run a full load once:
 --      python sync.py ... --change-capture none --mode truncate

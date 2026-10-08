@@ -8,7 +8,9 @@ on the stage. A final part shows stream-based change capture, including deletes.
 
 For architecture, network requirements, and production guidance, see the
 [top-level README](../README.md). For an unattended run of the whole sequence, use
-`./demo/run_demo.sh`.
+`./demo/run_demo.sh`. To check that awkward values (NULL, empty strings, non-ASCII text,
+quotes, newlines) survive both transports unchanged, run `./demo/verify_fidelity.sh`.
+Both accept `DEMO_TARGET=mssql`.
 
 **Presentation time:** approximately 25 minutes for Parts 1 to 4 and 6, plus 10 minutes for
 Part 5 (stream-based change capture). Part 5 can be skipped.
@@ -140,9 +142,10 @@ three are empty.
 | [snowflake_source.py](../snowflake_source.py#L42) `connect()` | Uses a named connection, key-pair, or PAT. The connection is outbound HTTPS to Snowflake. |
 | [snowflake_source.py](../snowflake_source.py#L103) `build_hwm_query()` | Selects rows between the last watermark and a ceiling captured before the read, so rows updated during the read are not skipped. |
 | [snowflake_source.py](../snowflake_source.py#L76) `read_query_batches()` | Streams the result as Apache Arrow batches with `fetch_pandas_batches()`. Memory use depends on batch size, not result size. |
-| [targets.py](../targets.py#L47) `MySQLTarget.write()` | Batched `INSERT ... ON DUPLICATE KEY UPDATE`, which is an upsert on the primary key. |
-| [sync.py](../sync.py#L18) module docstring, "High-water-mark (hwm) state" | Where the watermark is stored, its format, and the four-step cycle. |
-| [sync.py](../sync.py#L123) `run_hwm()` | The four steps in code: read the saved watermark, read the ceiling, load and commit, and only then save the new watermark. A failed run leaves the watermark unchanged and is retried from the same point. |
+| [transports.py](../transports.py#L45) `pull_apply()` | Transport A: writes each Arrow batch to the target. |
+| [targets.py](../targets.py#L65) `MySQLTarget.write()` | Batched `INSERT ... ON DUPLICATE KEY UPDATE`, which is an upsert on the primary key. The SQL Server writer uses a temporary table and `MERGE`. |
+| [change_capture.py](../change_capture.py#L13) module docstring, "High-water-mark (hwm) state" | Where the watermark is stored, its format, and the four-step cycle. |
+| [change_capture.py](../change_capture.py#L110) `plan_hwm()` | The four steps in code: read the saved watermark, read the ceiling, load and commit, and only then save the new watermark. The watermark is saved only after the target commit in [sync.py](../sync.py#L138) `main()`, so a failed run leaves it unchanged and is retried from the same point. |
 
 ### Run the initial load
 
@@ -197,15 +200,15 @@ cat sync_state.json
 
 | File | What to show |
 |---|---|
-| [unload_sync.py](../unload_sync.py#L72) `run()` | Four steps: unload to the stage, retrieve the files, bulk load, and save the watermark after commit. |
-| [snowflake_source.py](../snowflake_source.py#L191) `unload_to_stage()` | `COPY INTO @stage` writes gzip-compressed CSV files. Snowflake does the export work, in parallel for large results. NULLs are written as a sentinel so they can be told apart from empty strings. |
-| [snowflake_source.py](../snowflake_source.py#L224) `get_files()` | `GET` downloads the files over outbound HTTPS. With an external stage in production, the job reads the bucket with the cloud provider's SDK instead. |
-| [targets.py](../targets.py#L72) `MySQLTarget.bulk_load()` | `LOAD DATA LOCAL INFILE ... REPLACE`, the native MySQL bulk loader, with sentinel values converted back to NULL. |
+| [transports.py](../transports.py#L107) `unload_apply()` | Transport B: unload to the stage, retrieve the files, and bulk load. Change capture is the same code as Transport A; only `--transport unload` differs. |
+| [snowflake_source.py](../snowflake_source.py#L245) `unload_to_stage()` | `COPY INTO @stage` writes gzip-compressed CSV files. Snowflake does the export work, in parallel for large results. NULLs are written as a sentinel so they can be told apart from empty strings. |
+| [snowflake_source.py](../snowflake_source.py#L278) `get_files()` | `GET` downloads the files over outbound HTTPS. With an external stage in production, the job reads the bucket with the cloud provider's SDK instead. |
+| [targets.py](../targets.py#L105) `MySQLTarget.bulk_load()` | `LOAD DATA LOCAL INFILE ... REPLACE`, the native MySQL bulk loader, with sentinel values converted back to NULL. The SQL Server version, [`MSSQLTarget.bulk_load()`](../targets.py#L341), uses `BULK INSERT` into a temporary table and `MERGE`. |
 
 ### Run the initial load
 
 ```bash
-python unload_sync.py --source $SRC --target DENTAL_CLAIMS_STAGED \
+python sync.py --transport unload --source $SRC --target DENTAL_CLAIMS_STAGED \
     --change-capture hwm --hwm-col UPDATED_AT \
     --mode upsert --key-cols CLAIM_ID \
     --stage @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE \
@@ -214,15 +217,16 @@ python unload_sync.py --source $SRC --target DENTAL_CLAIMS_STAGED \
 
 **Expected output:**
 
-- `Unloaded 20 rows to @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE/dental_claims_staged/`
+- `Unloaded 20 rows to @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE/dental_claims_staged/upsert/`
 - `Bulk-loaded 1 file(s) (20 rows) -> DENTAL_CLAIMS_STAGED`
+- `HWM load complete: 20 rows, watermark advanced to ...`
 
 ### Show the files on the stage
 
 **Snowsight: run `[S3]`.**
 
-- `LIST @UNLOAD_STAGE` shows `dental_claims_staged/data_0_0_0.csv.gz` with its size and
-  MD5.
+- `LIST @UNLOAD_STAGE` shows `dental_claims_staged/upsert/data_0_0_0.csv.gz` with its size
+  and MD5.
 - The second query reads the compressed file in place and shows its 20 rows.
 
 `UNLOAD_STAGE` is a Snowflake internal stage. In production this is usually an external
@@ -235,11 +239,13 @@ the files from the `UNLOAD_STAGE` page in the Snowsight object explorer
 ### Show the files retrieved on premises
 
 ```bash
-ls -l _unload_tmp
-gzip -dc _unload_tmp/*.gz | head -5
+ls -l _unload_tmp/upsert
+gzip -dc _unload_tmp/upsert/*.gz | head -5
 ```
 
-The compressed file is what was transferred. The decompressed CSV is what MySQL loaded.
+The compressed file is what was transferred. The decompressed CSV is what the target loaded.
+On SQL Server with `bulk_insert`, a `.utf16` copy also appears: `BULK INSERT` reads that
+UTF-16 version so non-ASCII text loads correctly on every platform.
 
 **TablePlus:** refresh `DENTAL_CLAIMS_STAGED`. It contains the same 20 rows as
 `DENTAL_CLAIMS`.
@@ -265,7 +271,7 @@ python sync.py --source $SRC --target DENTAL_CLAIMS \
     --change-capture hwm --hwm-col UPDATED_AT \
     --mode upsert --key-cols CLAIM_ID
 
-python unload_sync.py --source $SRC --target DENTAL_CLAIMS_STAGED \
+python sync.py --transport unload --source $SRC --target DENTAL_CLAIMS_STAGED \
     --change-capture hwm --hwm-col UPDATED_AT \
     --mode upsert --key-cols CLAIM_ID \
     --stage @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE \
@@ -336,13 +342,15 @@ every change since, including the ones made in `[S2]`.
 |---|---|
 | [sql/01_snowflake_setup.sql](../sql/01_snowflake_setup.sql) | One-time setup: change tracking, the stream, and the outbox table. The demo versions are at the end of [setup_snowflake.sql](setup_snowflake.sql). |
 | [snowflake_source.py](../snowflake_source.py#L122) `consume_stream_to_outbox()` | `INSERT INTO outbox SELECT ... FROM stream` in one transaction. Committing it advances the stream offset; the changes are now held in the outbox. |
-| [sync.py](../sync.py#L151) `run_stream()` | Reads unexported outbox rows, drops the old-value half of each update, keeps the latest change per key, upserts and deletes in one MySQL transaction, and only then marks the outbox rows exported. |
+| [change_capture.py](../change_capture.py#L142) `plan_stream()` | Consumes the stream, snapshots the cutoff, and plans two queries: rows to upsert and keys to delete. |
+| [snowflake_source.py](../snowflake_source.py#L166) `build_outbox_changes_query()` | Runs in Snowflake: drops the old-value half of each update and keeps the latest change per key (`QUALIFY ROW_NUMBER()`). |
+| [snowflake_source.py](../snowflake_source.py#L201) `purge_outbox()` | After the target commit and the acknowledgement, deletes delivered rows (immediately by default, or after `--outbox-retention-days`). |
 
 **Talking points**
 
 - A stream offset advances only when a DML statement that reads the stream commits.
-  Snowflake and MySQL cannot share a transaction, so the outbox is the hand-off point: if
-  the MySQL write fails, the changes are still in the outbox and the next run applies them.
+  Snowflake and the target database cannot share a transaction, so the outbox is the hand-off point: if
+  the target write fails, the changes are still in the outbox and the next run applies them.
 - Applying the same change twice gives the same result, so delivery is at-least-once with
   a correct final state.
 
@@ -364,12 +372,14 @@ python sync.py --source $SRC --target DENTAL_CLAIMS_CDC \
     --change-capture stream \
     --stream SIMPLE_REVERSE_ETL_DEMO.DENTAL.CLAIMS_STREAM \
     --outbox SIMPLE_REVERSE_ETL_DEMO.DENTAL.CLAIMS_OUTBOX \
+    --outbox-retention-days 1 \
     --mode upsert --key-cols CLAIM_ID
 ```
 
 **Expected output:**
 
 - `Consumed 7 change rows from ... CLAIMS_STREAM into ... CLAIMS_OUTBOX`
+- `Purged 0 delivered row(s) from ... CLAIMS_OUTBOX (retention 1 day(s))`
 - `Stream CDC complete: 5 upserts, 0 deletes -> DENTAL_CLAIMS_CDC`
 
 The full load already contained these five changes, because they were made before it ran.
@@ -394,10 +404,11 @@ Run the same stream command (press the Up arrow), or show that Transport B suppo
 same change capture by running it through the unload path instead:
 
 ```bash
-python unload_sync.py --source $SRC --target DENTAL_CLAIMS_CDC \
+python sync.py --transport unload --source $SRC --target DENTAL_CLAIMS_CDC \
     --change-capture stream \
     --stream SIMPLE_REVERSE_ETL_DEMO.DENTAL.CLAIMS_STREAM \
     --outbox SIMPLE_REVERSE_ETL_DEMO.DENTAL.CLAIMS_OUTBOX \
+    --outbox-retention-days 1 \
     --mode upsert --key-cols CLAIM_ID \
     --stage @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE --local-dir _unload_tmp
 ```
@@ -424,8 +435,13 @@ of claim 5.
 by `_CDC_LOADED_AT`, with `_CDC_EXPORTED = TRUE` for all rows. Each update appears as its
 `DELETE` and `INSERT` halves.
 
+**Talking point:** the demo commands pass `--outbox-retention-days 1` so these delivered
+rows stay visible. By default the job deletes delivered rows right after each successful
+run, so in production the outbox only holds changes that have not been delivered yet. It
+is a transient table, so it also carries no Fail-safe storage cost.
+
 Optionally, run the stream command once more. It reports `Consumed 0 change rows` and
-`0 upserts, 0 deletes`.
+`Stream CDC: no un-exported changes`.
 
 ---
 

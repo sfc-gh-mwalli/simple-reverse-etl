@@ -1,9 +1,9 @@
 -- SQL Server target tables for the demo, equivalent to mysql_init.sql.
--- Applied by demo/reset_demo.sh (sqlcmd -i) when DEMO_TARGET=mssql. Safe to re-run.
+-- Applied by demo/reset_demo.sh (piped to sqlcmd) when DEMO_TARGET=mssql. Safe to re-run.
 -- PRIMARY KEY on CLAIM_ID is what the MERGE-based upsert matches on.
 --
 --   DENTAL_CLAIMS         <- Transport A, hwm change capture (sync.py)
---   DENTAL_CLAIMS_STAGED  <- Transport B (unload -> stage -> bulk load, unload_sync.py)
+--   DENTAL_CLAIMS_STAGED  <- Transport B (unload -> stage -> bulk load, sync.py --transport unload)
 --   DENTAL_CLAIMS_CDC     <- stream change capture (either transport)
 IF DB_ID(N'DENTAL_RPT') IS NULL
     CREATE DATABASE DENTAL_RPT;

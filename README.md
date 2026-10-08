@@ -50,21 +50,28 @@ flowchart LR
   job -->|"local network"| db
 ```
 
-Two transports are provided. Both write to the same target tables with the same
-change-capture and upsert options.
+A single job, `sync.py`, combines a change-capture mode (`--change-capture`: which rows
+to send) with one of two transports (`--transport`: how they move). Every combination is
+supported, and both transports write to the same target tables with the same write
+modes.
 
-**Transport A — connector pull (`sync.py`).** The job queries Snowflake through the
-Snowflake Connector for Python, consumes the result as Apache Arrow batches
-(`fetch_pandas_batches`), and writes each batch to the target with batched parameterized
-statements. Upserts use `INSERT ... ON DUPLICATE KEY UPDATE` on MySQL and a staging table
-plus `MERGE` on SQL Server. Memory use is bounded by batch size rather than result size.
+**Transport A — connector pull (`--transport pull`, the default).** The job queries
+Snowflake through the Snowflake Connector for Python, consumes the result as Apache Arrow
+batches (`fetch_pandas_batches`), and writes each batch to the target with batched
+parameterized statements. Upserts use `INSERT ... ON DUPLICATE KEY UPDATE` on MySQL and a
+session temporary table plus `MERGE` on SQL Server. Memory use is bounded by batch size
+rather than result size.
 
-**Transport B — unload and bulk load (`unload_sync.py`).** The job issues
+**Transport B — unload and bulk load (`--transport unload`).** The job issues
 `COPY INTO <stage>` so that Snowflake writes the result as compressed CSV files, retrieves
 the files, and loads them with the target database's native bulk loader
-(`LOAD DATA LOCAL INFILE` on MySQL). The Snowflake session is only needed for the unload
-and file retrieval; the load itself is decoupled from Snowflake and can be retried from
-the retrieved files.
+(`LOAD DATA LOCAL INFILE` on MySQL, `BULK INSERT` on SQL Server). The Snowflake session
+is only needed for the unload and file retrieval; the load itself is decoupled from
+Snowflake and can be retried from the retrieved files.
+
+The code follows the same split: [change_capture.py](change_capture.py) builds a plan of
+what to send, [transports.py](transports.py) moves it, [targets.py](targets.py) writes to
+MySQL or SQL Server, and [sync.py](sync.py) commits the target and then records progress.
 
 ## Network and firewall requirements
 
@@ -168,9 +175,11 @@ integration pattern.
   before extraction, loads the rows between the watermark and the ceiling, and records the
   ceiling as the new watermark only after the target commit succeeds, so a failed run is
   safely retried. The watermark is stored in a JSON file on the job host (`--state-file`,
-  default `./sync_state.json`), keyed by source table. On the first run, `--hwm-start`
+  default `./sync_state.json`), keyed by source and target table, so one file can track
+  several source/target pairs. On the first run, `--hwm-start`
   sets the starting point; without it, all existing rows are loaded. Keep the state file
-  on durable storage in production, or replace `_load_state`/`_save_state` with a control
+  on durable storage in production, or replace `load_state`/`save_state` in
+  [change_capture.py](change_capture.py) with a control
   table or scheduler variable.
 - `stream` — Both transports. Uses a Snowflake stream instead of a watermark column, and
   also propagates deletes. See [Stream-based change capture](#stream-based-change-capture).
@@ -212,10 +221,16 @@ reliable across two systems that cannot share a transaction:
    bulk-deletes the keys through a temporary table.
 4. **Acknowledge.** After the target commit, the job marks outbox rows up to the cutoff as
    exported. Rows consumed after the snapshot remain pending for the next run.
+5. **Purge.** The job then deletes delivered rows from the outbox. By default this happens
+   immediately, so the outbox only holds changes not yet delivered;
+   `--outbox-retention-days N` keeps delivered rows for N days, for example as an audit
+   trail. Rows that have not been delivered are never deleted.
 
 If the job fails after step 1, the changes stay in the outbox and are applied on the next
 run. If it fails after step 3 but before step 4, they are applied again. Upserts and
 deletes by key are idempotent, so delivery is at-least-once with a correct final state.
+A failure between steps 4 and 5 leaves delivered rows in the outbox until the next
+successful run purges them.
 
 **Setup.** Run once, as described in [sql/01_snowflake_setup.sql](sql/01_snowflake_setup.sql):
 
@@ -225,13 +240,18 @@ deletes by key are idempotent, so delivery is at-least-once with a correct final
   not report updates or deletes.
 - Create the outbox table with the source columns **in the same order**, followed by
   `_CDC_ACTION`, `_CDC_ISUPDATE`, `_CDC_LOADED_AT`, and `_CDC_EXPORTED`. The consume
-  statement inserts by position.
+  statement inserts by position. Create it as a **transient** table: it is short-lived
+  working data, so Fail-safe storage adds cost without a recovery benefit; one day of
+  Time Travel still allows `UNDROP`. If the outbox is ever lost, recreate the stream and
+  perform a full load. Use a permanent table only if delivered rows are retained as an
+  audit trail.
 - Perform an initial full load (`--change-capture none --mode truncate`) after creating the
   stream. Changes recorded between stream creation and the full load are applied again on
   the first stream run, which is harmless.
 
 **Privileges.** The job's role needs `USAGE` on the database and schema, `SELECT` on both
-the stream and its source table, and `SELECT`, `INSERT`, and `UPDATE` on the outbox.
+the stream and its source table, and `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on the
+outbox.
 
 **Operational notes.**
 
@@ -241,9 +261,9 @@ the stream and its source table, and `SELECT`, `INSERT`, and `UPDATE` on the out
   Monitor `STALE_AFTER` in `SHOW STREAMS` and schedule runs well inside that window.
 - *Recreating the source.* Replacing the source table (`CREATE OR REPLACE TABLE`) breaks
   the stream. Recreate the stream and perform a full load.
-- *Outbox growth.* Exported rows remain in the outbox as an audit trail. Purge them on a
-  schedule, for example `DELETE FROM <outbox> WHERE _CDC_EXPORTED AND _CDC_LOADED_AT <
-  DATEADD('day', -7, CURRENT_TIMESTAMP())`.
+- *Outbox size.* With the default `--outbox-retention-days 0`, the outbox is emptied of
+  delivered rows after every successful run. With a retention period, it holds that many
+  days of changes; each update is stored as two rows.
 - *Volume.* The reduction runs in Snowflake and both transports apply the result in a
   single target transaction. This suits regular deltas; for a very large backlog, perform
   a full load and recreate the stream instead.
@@ -254,7 +274,8 @@ the stream and its source table, and `SELECT`, `INSERT`, and `UPDATE` on the out
 ### Write modes
 
 `--mode truncate` replaces the target contents; `--mode upsert` merges on
-`--key-cols`, which must correspond to a primary or unique key on the target.
+`--key-cols`, which must correspond to a primary or unique key on the target;
+`--mode append` inserts only. Stream mode requires `--mode upsert`.
 
 **NULL handling (Transport B).** SQL `NULL` values are unloaded as an explicit sentinel and
 converted back to `NULL` during the bulk load, so `NULL` and empty strings remain distinct
@@ -299,7 +320,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Transport A:
+Transport A (the default, `--transport pull`):
 
 ```bash
 # Full refresh
@@ -316,24 +337,28 @@ python sync.py --source ANALYTICS.DENTAL.DENTAL_CLAIMS --target DENTAL_CLAIMS \
     --outbox ANALYTICS.DENTAL.CLAIMS_OUTBOX --mode upsert --key-cols CLAIM_ID
 ```
 
-Transport B:
+Transport B (`--transport unload`) accepts the same change-capture and write options,
+plus `--stage` and `--local-dir`:
 
 ```bash
 # Incremental upsert via unload and bulk load
-python unload_sync.py --source ANALYTICS.DENTAL.DENTAL_CLAIMS --target DENTAL_CLAIMS \
+python sync.py --transport unload \
+    --source ANALYTICS.DENTAL.DENTAL_CLAIMS --target DENTAL_CLAIMS \
     --change-capture hwm --hwm-col UPDATED_AT --mode upsert --key-cols CLAIM_ID \
     --stage @~/simple_reverse_etl --local-dir /var/lib/simple-reverse-etl/unload
 
 # Stream-based change capture, including deletes
-python unload_sync.py --source ANALYTICS.DENTAL.DENTAL_CLAIMS --target DENTAL_CLAIMS \
+python sync.py --transport unload \
+    --source ANALYTICS.DENTAL.DENTAL_CLAIMS --target DENTAL_CLAIMS \
     --change-capture stream --stream ANALYTICS.DENTAL.CLAIMS_STREAM \
     --outbox ANALYTICS.DENTAL.CLAIMS_OUTBOX --mode upsert --key-cols CLAIM_ID \
     --stage @~/simple_reverse_etl --local-dir /var/lib/simple-reverse-etl/unload
 ```
 
-Both commands exit non-zero on failure, roll back the target transaction, and leave the
-watermark or outbox state unchanged. Run `--help` on either script for the full option
-list.
+The job exits non-zero on failure, rolls back the target transaction, and leaves the
+watermark or outbox state unchanged. Options that do not apply to the chosen transport
+(for example `--stage` with `pull`, or `--commit-rows` with `unload`) are rejected. Run
+`python sync.py --help` for the full option list.
 
 ### SQL Server targets
 
@@ -356,14 +381,27 @@ list.
   `TARGET_MSSQL_TRUST_SERVER_CERT=yes`.
 - **Timestamps** keep their fractional seconds: parameters are bound with explicit
   precision, because `pyodbc` with `fast_executemany` otherwise drops milliseconds.
+- **Unicode.** Text parameters are bound as Unicode, because `pyodbc` otherwise sends
+  strings for `NVARCHAR(MAX)` columns as non-Unicode and characters outside the server
+  code page are lost. With `bulk_insert`, each unloaded file is converted to UTF-16 next
+  to the original and loaded with `DATAFILETYPE='widechar'`, which `BULK INSERT` reads
+  the same way on Windows and Linux (it does not reliably read UTF-8). Allow about twice
+  the file size in `--local-dir`.
+- **Empty strings.** `BULK INSERT` loads a quoted empty string as `NULL`. Because SQL
+  `NULL` values arrive as the sentinel, the load maps that `NULL` back to `''`, so empty
+  strings and `NULL` stay distinct with both load methods.
+- **Fidelity check.** [demo/verify_fidelity.sh](demo/verify_fidelity.sh) round-trips
+  `NULL`, empty strings, the sentinel text, non-ASCII text, quotes, commas, embedded
+  newlines, and padded text through both transports and compares every value with
+  Snowflake, on either demo target.
 
 ## Production considerations
 
 - **Service identity and privileges.** Run under a dedicated service user and role granted
   the minimum required: `USAGE` on the warehouse, database, and schema and `SELECT` on the
-  source; for stream mode, `SELECT` on the stream and its source table and `INSERT`,
-  `SELECT`, and `UPDATE` on the
-  outbox; for Transport B with a named stage, the appropriate stage privileges.
+  source; for stream mode, `SELECT` on the stream and its source table and `SELECT`,
+  `INSERT`, `UPDATE`, and `DELETE` on the outbox; for Transport B with a named stage,
+  the appropriate stage privileges (`READ` and `WRITE` on an internal stage).
 - **Secrets.** Do not deploy a populated `.env` file. Supply credentials from an approved
   secret store and prefer key-pair authentication over passwords or long-lived tokens.
 - **Scheduling.** The job has no scheduler of its own. Invoke it from the orchestrator
@@ -400,13 +438,14 @@ through a stream, and verifies the results against Snowflake. See
 ## Repository layout
 
 ```
+sync.py               Command-line entry point: --transport pull|unload, commit, progress
+change_capture.py     Which rows to send: full, hwm (watermark state), stream (outbox)
+transports.py         How rows move: pull (Arrow batches) or unload (stage, GET, bulk load)
+targets.py            MySQL and SQL Server writers (upsert, delete, bulk load, bulk delete)
+snowflake_source.py   Connection, Arrow reads, unload and GET, stream and outbox helpers
 config.py             Environment-based configuration for Snowflake and the target
-snowflake_source.py   Connection, Arrow batch reads, unload and GET, stream helpers
-targets.py            MySQL and SQL Server writers (upsert, bulk load)
-sync.py               Transport A command-line entry point
-unload_sync.py        Transport B command-line entry point
 sql/                  One-time Snowflake setup for stream-based change capture
-demo/                 Docker and Snowflake demonstration of both transports
+demo/                 Docker and Snowflake demonstration (MySQL or SQL Server)
 ```
 
 ## License
