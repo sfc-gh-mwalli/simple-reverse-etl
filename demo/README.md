@@ -270,7 +270,9 @@ UTF-16 version so non-ASCII text loads correctly on every platform.
 
 - Claims 1 and 2 are set to `PAID` with the amount increased by 100.
 - Claims 21, 22, and 23 are inserted.
-- The final query shows these five rows with a current `UPDATED_AT`.
+- Claim 10 is deleted.
+- The first query shows the five changed rows with a current `UPDATED_AT`; claim 10 is
+  not returned. The second query returns `ROW_COUNT = 22`.
 
 ### Run both transports again
 
@@ -293,7 +295,9 @@ python sync.py --transport unload --source $SRC --target DENTAL_CLAIMS_STAGED \
 - Transport A: `HWM load complete: 5 rows`
 - Transport B: `Unloaded 5 rows` and `Bulk-loaded 1 file(s) (5 rows)`
 
-Only the five changed rows were transferred, not the whole table.
+Only the five changed rows were transferred, not the whole table. Nothing was sent for
+claim 10: a deleted row has no `UPDATED_AT` to compare, so the watermark query simply
+stops returning it.
 
 **Show that the watermark advanced:**
 
@@ -306,8 +310,10 @@ keeps its own state file because each one tracks delivery to a different target 
 
 **Snowsight: run `[S3]` again.** The stage now contains only the five-row delta file.
 
-**TablePlus:** refresh both tables. Each contains 23 rows. Claims 1 and 2 show `PAID` with
-the updated amounts, and claims 21 to 23 are present. Optionally, open a SQL editor in
+**TablePlus:** refresh both tables. Each contains 23 rows, one more than Snowflake.
+Claims 1 and 2 show `PAID` with the updated amounts, claims 21 to 23 are present, and
+claim 10 is still there even though it was deleted in Snowflake. This is the main
+limitation of the watermark approach; Part 5 shows how a stream handles it. Optionally, open a SQL editor in
 TablePlus (Cmd+E) and confirm that the two tables are identical:
 
 ```sql
@@ -381,7 +387,7 @@ python sync.py --source $SRC --target DENTAL_CLAIMS_CDC \
     --change-capture none --mode truncate
 ```
 
-**Expected output:** `Full load complete: 23 rows -> DENTAL_CLAIMS_CDC`
+**Expected output:** `Full load complete: 22 rows -> DENTAL_CLAIMS_CDC`
 
 **Option: initial load with Transport B.** The initial load is an ordinary full load, so
 it can also go through the unload path. In production this is usually the better choice,
@@ -394,11 +400,12 @@ python sync.py --transport unload --source $SRC --target DENTAL_CLAIMS_CDC \
     --stage @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE --local-dir _unload_tmp
 ```
 
-**Expected output:** `Unloaded 23 rows to .../dental_claims_cdc/upsert/`,
-`Bulk-loaded 1 file(s) (23 rows) -> DENTAL_CLAIMS_CDC`, and
-`Full load complete: 23 rows -> DENTAL_CLAIMS_CDC`.
+**Expected output:** `Unloaded 22 rows to .../dental_claims_cdc/upsert/`,
+`Bulk-loaded 1 file(s) (22 rows) -> DENTAL_CLAIMS_CDC`, and
+`Full load complete: 22 rows -> DENTAL_CLAIMS_CDC`.
 
-**TablePlus:** refresh `DENTAL_CLAIMS_CDC`. It contains the same 23 rows as the other two
+**TablePlus:** refresh `DENTAL_CLAIMS_CDC`. It contains 22 rows, matching Snowflake. Claim 10
+is not there, because the full load reads the current table, unlike the two watermark
 tables.
 
 ### Delete and update in Snowflake
@@ -434,9 +441,9 @@ The three stream rows became one upsert (claim 3, new values only) and one delet
 
 **TablePlus:** refresh `DENTAL_CLAIMS_CDC`.
 
-- It contains 22 rows. Claim 5 is gone, and claim 3 shows `PAID`.
-- Compare with `DENTAL_CLAIMS`, which was loaded with the watermark: claim 5 is still
-  there. A watermark cannot detect deletes, and claim 3 is unchanged there until the next
+- It contains 21 rows. Claim 5 is gone, and claim 3 shows `PAID`.
+- Compare with `DENTAL_CLAIMS`, which was loaded with the watermark: claims 5 and 10 are
+  still there. A watermark cannot detect deletes, and claim 3 is unchanged there until the next
   watermark run.
 
 **Snowsight:** run the stream query from `[S6]` again. The stream is now empty.
@@ -474,7 +481,7 @@ python sync.py --transport unload --source $SRC --target DENTAL_CLAIMS_CDC \
 with the rows for claims 4 and 24. When a run includes deletes, a file with the deleted
 keys appears under `dental_claims_cdc/delete/` as well.
 
-**TablePlus:** refresh `DENTAL_CLAIMS_CDC`. It contains 23 rows, matching Snowflake: claim
+**TablePlus:** refresh `DENTAL_CLAIMS_CDC`. It contains 22 rows, matching Snowflake: claim
 24 is present, claim 4 shows `PAID`, and claim 5 is still gone.
 
 ### Show the outbox

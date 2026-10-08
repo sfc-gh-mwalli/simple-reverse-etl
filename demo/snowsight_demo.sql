@@ -10,7 +10,7 @@ SELECT * FROM DENTAL_CLAIMS ORDER BY CLAIM_ID;
 
 SELECT COUNT(*) AS ROW_COUNT, MAX(UPDATED_AT) AS LATEST_UPDATE FROM DENTAL_CLAIMS;
 
--- [S2] Simulate upstream changes: 2 updates + 3 inserts ----------------------
+-- [S2] Simulate upstream changes: 2 updates, 3 inserts, 1 delete ------------
 UPDATE DENTAL_CLAIMS
    SET CLAIM_STATUS = 'PAID',
        AMOUNT       = AMOUNT + 100.00,
@@ -23,10 +23,15 @@ VALUES
     (22, 66666, 'SUBMITTED', 654.00, CURRENT_TIMESTAMP()),
     (23, 77777, 'DENIED',    987.00, CURRENT_TIMESTAMP());
 
--- Rows that the next incremental run will pick up
+-- A watermark cannot see this delete: claim 10 stays in both hwm targets.
+DELETE FROM DENTAL_CLAIMS WHERE CLAIM_ID = 10;
+
+-- Rows that the next incremental run will pick up (claim 10 is gone)
 SELECT * FROM DENTAL_CLAIMS
- WHERE CLAIM_ID IN (1, 2, 21, 22, 23)
+ WHERE CLAIM_ID IN (1, 2, 10, 21, 22, 23)
  ORDER BY CLAIM_ID;
+
+SELECT COUNT(*) AS ROW_COUNT FROM DENTAL_CLAIMS;  -- 22
 
 -- [S3] Files unloaded by Transport B -----------------------------------------
 LIST @UNLOAD_STAGE;
