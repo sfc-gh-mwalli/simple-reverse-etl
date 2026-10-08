@@ -383,6 +383,21 @@ python sync.py --source $SRC --target DENTAL_CLAIMS_CDC \
 
 **Expected output:** `Full load complete: 23 rows -> DENTAL_CLAIMS_CDC`
 
+**Option: initial load with Transport B.** The initial load is an ordinary full load, so
+it can also go through the unload path. In production this is usually the better choice,
+because the initial load is the one large transfer; the stream runs that follow are small
+deltas and work with either transport.
+
+```bash
+python sync.py --transport unload --source $SRC --target DENTAL_CLAIMS_CDC \
+    --change-capture none --mode truncate \
+    --stage @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE --local-dir _unload_tmp
+```
+
+**Expected output:** `Unloaded 23 rows to .../dental_claims_cdc/upsert/`,
+`Bulk-loaded 1 file(s) (23 rows) -> DENTAL_CLAIMS_CDC`, and
+`Full load complete: 23 rows -> DENTAL_CLAIMS_CDC`.
+
 **TablePlus:** refresh `DENTAL_CLAIMS_CDC`. It contains the same 23 rows as the other two
 tables.
 
@@ -451,6 +466,8 @@ python sync.py --transport unload --source $SRC --target DENTAL_CLAIMS_CDC \
 - `Consumed 3 change rows`
 - `Unloaded 2 rows to @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE/dental_claims_cdc/upsert/`
 - `Unloaded 0 rows to .../dental_claims_cdc/delete/` (this run has no deletes)
+- `Bulk-loaded 1 file(s) (2 rows) -> DENTAL_CLAIMS_CDC`
+- `Purged 0 delivered row(s) from ... CLAIMS_OUTBOX (retention 1 day(s))`
 - `Stream CDC complete: 2 upserts, 0 deletes -> DENTAL_CLAIMS_CDC`
 
 **Snowsight: run `[S3]`.** `LIST @UNLOAD_STAGE` shows a file under `dental_claims_cdc/upsert/`
