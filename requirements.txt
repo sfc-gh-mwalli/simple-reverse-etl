@@ -2,7 +2,9 @@
 # Pin/adjust versions to whatever your organization's approved package index allows.
 
 # Snowflake read side (Arrow/pandas fetch = compressed, batched, high throughput)
-snowflake-connector-python[pandas]>=3.12
+# Validated with 4.x; 5.x changes proxy and certificate-revocation behavior
+# (see README, "Connector versions"). Pin an exact version in production.
+snowflake-connector-python[pandas]>=4.0,<5
 
 # Key-pair auth (production path; not needed for the PAT demo but harmless to install)
 cryptography>=42.0

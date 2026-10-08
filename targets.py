@@ -14,7 +14,7 @@ don't care which RDBMS they're talking to:
     w.commit(); w.rollback(); w.close()
 
 `rows` is a list of tuples aligned to `columns`. NULLs must already be Python
-None (sync.py normalizes pandas NaN/NaT -> None before calling).
+None (transports.py normalizes pandas NaN/NaT -> None before calling).
 
 Transport B CSV files are produced by snowflake_source.unload_to_stage: a header
 row, fields optionally enclosed in double quotes, and SQL NULL written as the

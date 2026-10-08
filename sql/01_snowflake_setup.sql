@@ -74,7 +74,7 @@ DATA_RETENTION_TIME_IN_DAYS = 1;
 -- does NOT advance any offset (you track the last processed time yourself,
 -- same idea as the =hwm path). Requires CHANGE_TRACKING = TRUE (step 1 only).
 --
---   SELECT *, METADATA$ACTION, METADATA$ISUPDATE
+--   SELECT *   -- includes METADATA$ACTION, METADATA$ISUPDATE, METADATA$ROW_ID
 --   FROM ANALYTICS.DENTAL.CLAIMS
 --   CHANGES (INFORMATION => DEFAULT)
 --   AT (TIMESTAMP => :last_run_ts)

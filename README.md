@@ -51,9 +51,9 @@ flowchart LR
 ```
 
 A single job, `sync.py`, combines a change-capture mode (`--change-capture`: which rows
-to send) with one of two transports (`--transport`: how they move). Every combination is
-supported, and both transports write to the same target tables with the same write
-modes.
+to send) with one of two transports (`--transport`: how they move). Every change-capture
+mode works with both transports, and both transports write to the same target tables with
+the same write modes.
 
 **Transport A — connector pull (`--transport pull`, the default).** The job queries
 Snowflake through the Snowflake Connector for Python, consumes the result as Apache Arrow
@@ -65,9 +65,10 @@ rather than result size.
 **Transport B — unload and bulk load (`--transport unload`).** The job issues
 `COPY INTO <stage>` so that Snowflake writes the result as compressed CSV files, retrieves
 the files, and loads them with the target database's native bulk loader
-(`LOAD DATA LOCAL INFILE` on MySQL, `BULK INSERT` on SQL Server). The Snowflake session
-is only needed for the unload and file retrieval; the load itself is decoupled from
-Snowflake and can be retried from the retrieved files.
+(`LOAD DATA LOCAL INFILE` on MySQL, `BULK INSERT` on SQL Server). Snowflake does the
+extraction in parallel, and the target load reads local files rather than a live result
+set. The files of the last run are kept in `--local-dir` and on the stage until the next
+run for the same target, so a failed load can be inspected; a rerun unloads again.
 
 The code follows the same split: [change_capture.py](change_capture.py) builds a plan of
 what to send, [transports.py](transports.py) moves it, [targets.py](targets.py) writes to
@@ -157,8 +158,8 @@ the connectivity profile:
 | Components | Job, Snowflake, target | Job, Snowflake, stage storage, target |
 | Suitable volumes | Incremental deltas and moderate tables | Large full or incremental loads |
 | Load mechanism | Batched parameterized DML | Native bulk load |
-| Snowflake session | Used for the duration of the load | Used only for unload and retrieval |
-| Recovery | Re-query the source | Re-load from retrieved files |
+| Target load reads from | Live query result | Local files retrieved from the stage |
+| After a failure | Rerun; the window is queried again | Rerun; the window is unloaded again |
 | Change capture | `none`, `hwm`, `stream` | `none`, `hwm`, `stream` |
 | Targets | MySQL, SQL Server | MySQL (`LOAD DATA LOCAL INFILE`), SQL Server (`BULK INSERT` or client-side batches) |
 
@@ -173,7 +174,9 @@ integration pattern.
 
 - `none` — the full source on every run. Typically combined with `--mode truncate`.
 - `hwm` — rows whose monotonic high-water-mark column (for example `UPDATED_AT`) is greater
-  than the last delivered value (the watermark). Each run reads `MAX(col)` as a ceiling
+  than the last delivered value (the watermark). Requires `--mode upsert` (or `append`);
+  `truncate` is rejected because it would empty the target before loading only the delta.
+  Each run reads `MAX(col)` as a ceiling
   before extraction, loads the rows between the watermark and the ceiling, and records the
   ceiling as the new watermark only after the target commit succeeds, so a failed run is
   safely retried. The watermark is stored in a JSON file on the job host (`--state-file`,
@@ -277,7 +280,8 @@ outbox.
 
 `--mode truncate` replaces the target contents; `--mode upsert` merges on
 `--key-cols`, which must correspond to a primary or unique key on the target;
-`--mode append` inserts only. Stream mode requires `--mode upsert`.
+`--mode append` inserts only. `hwm` requires `upsert` or `append`; stream mode requires
+`upsert`.
 
 **NULL handling (Transport B).** SQL `NULL` values are unloaded as an explicit sentinel and
 converted back to `NULL` during the bulk load, so `NULL` and empty strings remain distinct
@@ -358,8 +362,9 @@ python sync.py --transport unload \
 ```
 
 The job exits non-zero on failure, rolls back the target transaction, and leaves the
-watermark or outbox state unchanged. Options that do not apply to the chosen transport
-(for example `--stage` with `pull`, or `--commit-rows` with `unload`) are rejected. Run
+watermark or outbox state unchanged. Invalid option combinations exit with code 2 before
+connecting, including options that do not apply to the chosen transport (for example
+`--stage` with `pull`, or `--commit-rows` with `unload`). Run
 `python sync.py --help` for the full option list.
 
 **Transactions.** Transport B and stream mode apply each run in one target transaction.
@@ -468,8 +473,9 @@ targets whose columns are defined in lower case and compared case-sensitively.
 
 A self-contained demonstration runs both transports against a Snowflake table and a local
 MySQL or SQL Server instance in Docker (`DEMO_TARGET=mysql|mssql`). It performs a full
-load and an incremental upsert with each transport, applies inserts, updates, and deletes
-through a stream, and verifies the results against Snowflake. See
+load and an incremental upsert with each transport, shows that a watermark leaves deleted
+rows in the target, applies inserts, updates, and deletes through a stream, and verifies
+the results against Snowflake. See
 [demo/README.md](demo/README.md).
 
 ## Repository layout

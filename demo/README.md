@@ -153,7 +153,7 @@ three are empty.
 | [targets.py](../targets.py#L65) `MySQLTarget.write()` | MySQL: batched `INSERT ... ON DUPLICATE KEY UPDATE`, an upsert on the primary key. |
 | [targets.py](../targets.py#L313) `MSSQLTarget.write()` | SQL Server: batched inserts into a session temporary table, then one `MERGE`. |
 | [change_capture.py](../change_capture.py#L13) module docstring, "High-water-mark (hwm) state" | Where the watermark is stored, its format, and the four-step cycle. |
-| [change_capture.py](../change_capture.py#L110) `plan_hwm()` | The four steps in code: read the saved watermark, read the ceiling, load and commit, and only then save the new watermark. The watermark is saved only after the target commit in [sync.py](../sync.py#L138) `main()`, so a failed run leaves it unchanged and is retried from the same point. |
+| [change_capture.py](../change_capture.py#L110) `plan_hwm()` | The four steps in code: read the saved watermark, read the ceiling, load and commit, and only then save the new watermark. The watermark is saved only after the target commit in [sync.py](../sync.py#L142) `main()`, so a failed run leaves it unchanged and is retried from the same point. |
 
 ### Run the initial load
 
@@ -365,7 +365,7 @@ insert through the stream, once with each transport.
 | File | What to show |
 |---|---|
 | [snowflake_source.py](../snowflake_source.py#L122) `consume_stream_to_outbox()` | `INSERT INTO outbox SELECT ... FROM stream` in one transaction. Committing it advances the stream offset; the changes are now held in the outbox. |
-| [change_capture.py](../change_capture.py#L142) `plan_stream()` | Consumes the stream, snapshots the cutoff, and plans two queries: rows to upsert and keys to delete. |
+| [change_capture.py](../change_capture.py#L148) `plan_stream()` | Consumes the stream, snapshots the cutoff, and plans two queries: rows to upsert and keys to delete. |
 | [snowflake_source.py](../snowflake_source.py#L166) `build_outbox_changes_query()` | Runs in Snowflake: drops the old-value half of each update and keeps the latest change per key (`QUALIFY ROW_NUMBER()`). |
 | [snowflake_source.py](../snowflake_source.py#L201) `purge_outbox()` | After the target commit and the acknowledgement, deletes delivered rows (immediately by default, or after `--outbox-retention-days`). |
 
@@ -505,10 +505,10 @@ Optionally, run the stream command once more. It reports `Consumed 0 change rows
 |---|---|---|
 | Best for | Incremental deltas and moderate volumes | Large full or incremental loads |
 | Load method | Batched upsert statements | Native bulk loader |
-| Recovery | Re-query Snowflake | Reload from retrieved files |
+| After a failure | Rerun; the window is queried again | Rerun; the window is unloaded again (the last run's files stay in `_unload_tmp` for inspection) |
 | Change capture | `none`, `hwm`, `stream` | `none`, `hwm`, `stream` |
 | Target load | MySQL `INSERT ... ON DUPLICATE KEY UPDATE`; SQL Server `MERGE` | MySQL `LOAD DATA LOCAL INFILE`; SQL Server `BULK INSERT` |
-| Job host connects to | Snowflake (and stage storage) | Snowflake and stage storage, or only the bucket when Snowflake schedules the unload |
+| Job host connects to | Snowflake (and stage storage) | Snowflake and stage storage, or only the bucket if Snowflake schedules the unload (described in the main README, not implemented) |
 
 | | Watermark (`hwm`) | Stream |
 |---|---|---|

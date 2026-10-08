@@ -19,7 +19,7 @@ Write modes (--mode):
   append    plain inserts
 
 Every run is one target transaction (the pull transport may commit every
---commit-rows rows for none/hwm). Watermark or outbox state advances only after
+--commit-rows rows for none/hwm). hwm needs --mode upsert or append. Watermark or outbox state advances only after
 the target commit, so a failed run is retried from the same point.
 
 Examples
@@ -114,8 +114,12 @@ def validate(args) -> str | None:
     """Returns an error message, or None. Also fills transport defaults."""
     if args.mode == "upsert" and not args.key_cols:
         return "--mode upsert requires --key-cols"
-    if args.change_capture == "hwm" and not args.hwm_col:
-        return "--change-capture hwm requires --hwm-col"
+    if args.change_capture == "hwm":
+        if not args.hwm_col:
+            return "--change-capture hwm requires --hwm-col"
+        if args.mode == "truncate":
+            # Truncating and then loading only the delta would lose every other row.
+            return "--change-capture hwm requires --mode upsert or --mode append"
     if args.change_capture == "stream":
         if not (args.stream and args.outbox):
             return "--change-capture stream requires --stream and --outbox"
@@ -152,6 +156,8 @@ def main(argv=None) -> int:
         # 1. Change capture decides which rows to send (None: nothing to do).
         plan = PLANNERS[args.change_capture](sf_conn, args)
         if plan is None:
+            target.close()
+            sf_conn.close()
             return 0
         # 2. The transport moves them into the target.
         written, deleted = TRANSPORTS[args.transport](sf_conn, target, plan, args)

@@ -116,9 +116,9 @@ cat <<'TXT'
                                  and moderate volumes. Uses a Snowflake session
                                  for the duration of the load; batched DML writes.
   Transport B (unload + bulk):   compressed unload and native bulk load; suited to
-                                 large full or incremental loads. The load is
-                                 decoupled from Snowflake and can be retried from
-                                 the retrieved files.
+                                 large full or incremental loads. Snowflake
+                                 extracts in parallel; the target loads local
+                                 files with its native bulk loader.
   Watermark vs stream:           a watermark needs a reliable UPDATED_AT column and
                                  cannot see deletes; a stream captures inserts,
                                  updates, and deletes.

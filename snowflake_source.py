@@ -1,6 +1,6 @@
 """Snowflake source: connection + high-throughput batched read + CDC helpers.
 
-Performance notes (matters at 30-60M rows):
+Performance notes (matter for large tables):
   * fetch_pandas_batches() pulls results in the Arrow format the server already
     produces. Arrow is columnar and compressed on the wire, and we get ONE
     pandas DataFrame per result batch instead of materializing the whole result
@@ -8,7 +8,7 @@ Performance notes (matters at 30-60M rows):
   * For a distributed/parallel fetch, cur.get_result_batches() hands back
     ResultBatch objects you can farm out to threads/processes. We keep the main
     path single-stream because for this use case the on-prem RDBMS write is the
-    bottleneck, not the Snowflake read. See README "Scaling up".
+    bottleneck, not the Snowflake read. See README "Production considerations".
 """
 from __future__ import annotations
 
@@ -250,7 +250,7 @@ def unload_to_stage(conn, query: str, stage_path: str, params=None) -> int:
     keeps re-runs idempotent. SQL NULL is written as the literal token '__NULL__'
     (with EMPTY_FIELD_AS_NULL=FALSE so real empty strings stay distinct); the
     bulk loader turns that token back into NULL. The '__NULL__' sentinel must
-    match the one in targets.MySQLTarget.bulk_load.
+    match targets.NULL_TOKEN.
     """
     sql = (
         f"COPY INTO {stage_path} FROM ({query}) "

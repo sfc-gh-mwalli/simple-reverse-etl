@@ -115,9 +115,15 @@ def plan_hwm(sf_conn, args) -> LoadPlan | None:
     if last is None:
         last = args.hwm_start
     # 2. Ceiling captured before reading, so rows updated mid-read wait for next run.
-    ceiling = sf.scalar(sf_conn, f"SELECT MAX({args.hwm_col}) FROM {args.source}")
-    if ceiling is None or (last is not None and str(ceiling) <= str(last)):
-        log.info("No new rows above watermark %r (ceiling %r).", last, ceiling)
+    #    The comparison with the watermark runs in Snowflake, in the column's type.
+    if last is None:
+        ceiling = sf.scalar(sf_conn, f"SELECT MAX({args.hwm_col}) FROM {args.source}")
+    else:
+        ceiling = sf.scalar(sf_conn, f"SELECT MAX({args.hwm_col}) FROM {args.source} "
+                                     f"WHERE {args.hwm_col} > %(watermark)s",
+                            {"watermark": last})
+    if ceiling is None:
+        log.info("No new rows above watermark %r.", last)
         return None
     log.info("HWM window: %r < %s <= %r", last, args.hwm_col, ceiling)
 
