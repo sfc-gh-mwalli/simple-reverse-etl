@@ -150,8 +150,8 @@ the connectivity profile:
 | Load mechanism | Batched parameterized DML | Native bulk load |
 | Snowflake session | Used for the duration of the load | Used only for unload and retrieval |
 | Recovery | Re-query the source | Re-load from retrieved files |
-| Change capture | `none`, `hwm`, `stream` | `none`, `hwm` |
-| Targets | MySQL, SQL Server | MySQL (SQL Server bulk load not implemented) |
+| Change capture | `none`, `hwm`, `stream` | `none`, `hwm`, `stream` |
+| Targets | MySQL, SQL Server | MySQL (`LOAD DATA LOCAL INFILE`), SQL Server (`BULK INSERT` or client-side batches) |
 
 Transport A is the simpler option and is well suited to scheduled delta synchronization.
 Transport B is preferable when full reloads or large deltas make row-level DML the
@@ -172,7 +172,7 @@ integration pattern.
   sets the starting point; without it, all existing rows are loaded. Keep the state file
   on durable storage in production, or replace `_load_state`/`_save_state` with a control
   table or scheduler variable.
-- `stream` — Transport A only. Uses a Snowflake stream instead of a watermark column, and
+- `stream` — Both transports. Uses a Snowflake stream instead of a watermark column, and
   also propagates deletes. See [Stream-based change capture](#stream-based-change-capture).
 
 **Choosing `hwm` or `stream`.**
@@ -184,7 +184,7 @@ integration pattern.
 | Deletes | No; deleted rows remain in the target | Yes |
 | Position stored in | JSON state file on the job host | Stream offset and outbox table in Snowflake |
 | Snowflake objects to create | None | Stream and outbox table |
-| Transports | A and B | A only |
+| Transports | A and B | A and B |
 | Operational risk | Rows updated without changing the column are missed | Stream becomes stale if not consumed within the retention period |
 
 ### Stream-based change capture
@@ -199,14 +199,19 @@ reliable across two systems that cannot share a transaction:
    into an outbox table in Snowflake, together with the change type, an update flag, and a
    load timestamp. Committing this statement advances the stream offset; the changes are
    now held in the outbox.
-2. **Reduce.** The job reads every outbox row not yet marked exported. A stream represents
-   an update as two rows: a `DELETE` with the old values and an `INSERT` with the new
-   values, both with `METADATA$ISUPDATE = TRUE`. The job discards the old-value rows and
-   keeps only the most recent change for each key, so the outbox can safely hold the
-   changes from several consumes.
+2. **Snapshot and reduce.** The job records the newest `_CDC_LOADED_AT` among outbox rows
+   not yet exported (the cutoff) and handles only rows up to it. A stream represents an
+   update as two rows: a `DELETE` with the old values and an `INSERT` with the new values,
+   both with `METADATA$ISUPDATE = TRUE`. A query in Snowflake discards the old-value rows
+   and keeps only the most recent change for each key (`QUALIFY ROW_NUMBER() ...`), so the
+   outbox can safely hold the changes from several consumes.
 3. **Apply.** Remaining inserts are upserted on `--key-cols`, and plain deletes are deleted
-   by key, in one target transaction.
-4. **Acknowledge.** After the target commit, the job marks the outbox rows exported.
+   by key, in one target transaction. Transport A reads the reduced result in Arrow
+   batches. Transport B unloads it twice, as full rows to `<stage>/<target>/upsert/` and
+   as key columns to `<stage>/<target>/delete/`, then bulk-loads the upserts and
+   bulk-deletes the keys through a temporary table.
+4. **Acknowledge.** After the target commit, the job marks outbox rows up to the cutoff as
+   exported. Rows consumed after the snapshot remain pending for the next run.
 
 If the job fails after step 1, the changes stay in the outbox and are applied on the next
 run. If it fails after step 3 but before step 4, they are applied again. Upserts and
@@ -239,8 +244,9 @@ the stream and its source table, and `SELECT`, `INSERT`, and `UPDATE` on the out
 - *Outbox growth.* Exported rows remain in the outbox as an audit trail. Purge them on a
   schedule, for example `DELETE FROM <outbox> WHERE _CDC_EXPORTED AND _CDC_LOADED_AT <
   DATEADD('day', -7, CURRENT_TIMESTAMP())`.
-- *Volume.* All pending outbox rows are reduced in memory in one pass. This suits regular
-  deltas; for a large backlog, perform a full load and recreate the stream instead.
+- *Volume.* The reduction runs in Snowflake and both transports apply the result in a
+  single target transaction. This suits regular deltas; for a very large backlog, perform
+  a full load and recreate the stream instead.
 - *Alternative.* The `CHANGES` clause reads change-tracking data between two timestamps
   without a stream or outbox. Its position must then be tracked by the job, as with `hwm`.
   An example is included in `sql/01_snowflake_setup.sql`; it is not implemented in the job.
@@ -272,6 +278,10 @@ or secret store.
 | `TARGET_KIND` | `mysql` or `mssql`. |
 | `TARGET_HOST`, `TARGET_PORT`, `TARGET_DATABASE`, `TARGET_USER`, `TARGET_PASSWORD` | Target database connection. |
 | `TARGET_ODBC_DRIVER` | ODBC driver name for SQL Server (default `ODBC Driver 18 for SQL Server`). |
+| `TARGET_MSSQL_ENCRYPT` | SQL Server: encrypt the connection (`yes` or `no`, default `yes`). |
+| `TARGET_MSSQL_TRUST_SERVER_CERT` | SQL Server: skip server certificate validation (default `no`). Set `yes` only for test servers with self-signed certificates. |
+| `TARGET_MSSQL_LOAD_METHOD` | SQL Server, Transport B: `bulk_insert` (default) or `client`. See [SQL Server targets](#sql-server-targets). |
+| `TARGET_MSSQL_BULK_DIR` | SQL Server, `bulk_insert` only: the `--local-dir` folder as SQL Server sees it, for example `\\fileserver\share\unload`. |
 | `LOG_LEVEL` | Python logging level (default `INFO`). |
 
 **Authentication.** For unattended execution, use
@@ -313,11 +323,39 @@ Transport B:
 python unload_sync.py --source ANALYTICS.DENTAL.DENTAL_CLAIMS --target DENTAL_CLAIMS \
     --change-capture hwm --hwm-col UPDATED_AT --mode upsert --key-cols CLAIM_ID \
     --stage @~/simple_reverse_etl --local-dir /var/lib/simple-reverse-etl/unload
+
+# Stream-based change capture, including deletes
+python unload_sync.py --source ANALYTICS.DENTAL.DENTAL_CLAIMS --target DENTAL_CLAIMS \
+    --change-capture stream --stream ANALYTICS.DENTAL.CLAIMS_STREAM \
+    --outbox ANALYTICS.DENTAL.CLAIMS_OUTBOX --mode upsert --key-cols CLAIM_ID \
+    --stage @~/simple_reverse_etl --local-dir /var/lib/simple-reverse-etl/unload
 ```
 
 Both commands exit non-zero on failure, roll back the target transaction, and leave the
 watermark or outbox state unchanged. Run `--help` on either script for the full option
 list.
+
+### SQL Server targets
+
+- **Driver.** Install the Microsoft ODBC Driver 18 for SQL Server on the job host. On
+  macOS with Homebrew, the driver supports OpenSSL 1.1 or 3; if `openssl@4` is installed,
+  `/opt/homebrew/opt/openssl` must point to `openssl@3`.
+- **Upserts** use a session temporary table and one `MERGE ... WITH (HOLDLOCK)` per batch.
+  No staging tables need to be created in the target database.
+- **Transport B load methods** (`TARGET_MSSQL_LOAD_METHOD`):
+  - `bulk_insert` (default): SQL Server reads the files itself with `BULK INSERT`. The job
+    writes the files to `--local-dir`, which must be a folder SQL Server can also read; set
+    `TARGET_MSSQL_BULK_DIR` to that folder as SQL Server sees it (for example a UNC share).
+    The login needs `ADMINISTER BULK OPERATIONS` (or the `bulkadmin` role) and the SQL
+    Server service account needs read access to the folder.
+  - `client`: the job reads the files and sends them in batches with `fast_executemany`.
+    No shared folder or bulk permission is needed; throughput is lower than `bulk_insert`.
+  - `bcp` is not used because it cannot parse the quoted CSV fields that the unload writes.
+- **Certificates.** Connections are encrypted and the server certificate is validated by
+  default. Install the server's CA certificate on the job host rather than setting
+  `TARGET_MSSQL_TRUST_SERVER_CERT=yes`.
+- **Timestamps** keep their fractional seconds: parameters are bound with explicit
+  precision, because `pyodbc` with `fast_executemany` otherwise drops milliseconds.
 
 ## Production considerations
 
@@ -333,6 +371,9 @@ list.
   overlap.
 - **Target schema.** Target tables must exist before the first run, with column names
   matching the source projection and a key that supports the chosen upsert.
+- **MySQL truncate.** `TRUNCATE` commits implicitly on MySQL, so a full load that fails
+  after it leaves the table empty until the next successful run. On SQL Server, `TRUNCATE`
+  is part of the load transaction.
 - **Volume.** Prefer incremental change capture over full reloads, and prefer Transport B
   where row-level DML becomes the bottleneck. Transport A read throughput can be increased
   further with `cursor.get_result_batches()` for parallel retrieval.
@@ -341,10 +382,9 @@ list.
 
 ## Known limitations
 
-- SQL Server bulk load for Transport B is not implemented; the method documents a
-  `BULK INSERT` / `bcp` approach. Transport A supports SQL Server fully.
-- Transport B supports `none` and `hwm` change capture; stream-based change capture is
-  available only through Transport A.
+- SQL Server `BULK INSERT` has been tested with a folder mounted into the SQL Server
+  container. Reading from a network share depends on the share permissions of the SQL
+  Server service account and has not been tested.
 - Retrieval from external stages (cloud SDK instead of `GET`) and Snowflake-scheduled
   unloads are described above but not implemented.
 - Schema evolution is not managed; source and target structures must be kept aligned.
@@ -352,8 +392,10 @@ list.
 ## Demo
 
 A self-contained demonstration runs both transports against a Snowflake table and a local
-MySQL instance in Docker, performs a full load and an incremental upsert with each, and
-verifies that both produce identical results. See [demo/README.md](demo/README.md).
+MySQL or SQL Server instance in Docker (`DEMO_TARGET=mysql|mssql`). It performs a full
+load and an incremental upsert with each transport, applies inserts, updates, and deletes
+through a stream, and verifies the results against Snowflake. See
+[demo/README.md](demo/README.md).
 
 ## Repository layout
 

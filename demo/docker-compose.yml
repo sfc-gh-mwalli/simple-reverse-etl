@@ -15,3 +15,30 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+
+  # Optional SQL Server target, started only with `--profile mssql`
+  # (demo scripts do this when DEMO_TARGET=mssql). SQL Server 2022 Developer
+  # edition; the image is x86-64 and runs under emulation on Apple silicon.
+  # Starting it accepts the SQL Server Developer edition license (ACCEPT_EULA).
+  mssql:
+    profiles: ["mssql"]
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    container_name: simple-reverse-etl-demo-mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: Demo_Passw0rd    # throwaway, local container only
+    ports:
+      - "127.0.0.1:1433:1433"
+    volumes:
+      - ./mssql_init.sql:/demo/mssql_init.sql:ro
+      # Transport B --local-dir, visible to SQL Server for BULK INSERT
+      # (TARGET_MSSQL_BULK_DIR=/var/opt/unload). In production this is a share.
+      - ../_unload_tmp:/var/opt/unload:ro
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -C -b -Q \"SELECT 1\" >/dev/null"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s

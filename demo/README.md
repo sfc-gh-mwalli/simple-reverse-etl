@@ -60,29 +60,52 @@ Part 5 (stream-based change capture). Part 5 can be skipped.
 
 ## Reset before each presentation
 
+The demo runs against MySQL by default, or against SQL Server when `DEMO_TARGET=mssql` is
+set. Choose one and use it for the whole presentation.
+
 In the terminal, from the repository root:
 
 ```bash
-./demo/reset_demo.sh
+./demo/reset_demo.sh                     # MySQL
+DEMO_TARGET=mssql ./demo/reset_demo.sh   # SQL Server
 ```
 
 The reset script:
 
-- starts MySQL, creates any missing target tables, and empties `DENTAL_CLAIMS`,
-  `DENTAL_CLAIMS_STAGED`, and `DENTAL_CLAIMS_CDC`
+- starts the target container, creates any missing target tables, and empties
+  `DENTAL_CLAIMS`, `DENTAL_CLAIMS_STAGED`, and `DENTAL_CLAIMS_CDC`
 - recreates the Snowflake source with 20 rows, recreates the stream `CLAIMS_STREAM` and the
   outbox table `CLAIMS_OUTBOX`, and creates and empties the stage `UNLOAD_STAGE`
 - removes the local watermark files and any previously retrieved files
 
-Then prepare the terminal session that you will present from:
+Then prepare the terminal session that you will present from. This loads the Snowflake
+settings, sets the target connection, and activates the virtual environment:
 
 ```bash
-set -a; source demo/.env.demo; set +a
-source demo/.venv/bin/activate
+export DEMO_TARGET=mysql                 # or: export DEMO_TARGET=mssql
+source demo/target_env.sh
 export SRC=SIMPLE_REVERSE_ETL_DEMO.DENTAL.DENTAL_CLAIMS
 ```
 
+All commands in Parts 1 to 5 are identical for both targets.
+
 **Check:** the script ends with `Reset complete`. In TablePlus, all three tables are empty.
+
+### Running against SQL Server
+
+- **Prerequisites.** Microsoft ODBC Driver 18 for SQL Server on your machine (see
+  [SQL Server targets](../README.md#sql-server-targets)). The first start downloads the
+  `mcr.microsoft.com/mssql/server:2022-latest` image and accepts the SQL Server Developer
+  edition license. On Apple silicon the image runs under emulation.
+- **TablePlus.** Create a **Microsoft SQL Server** connection named
+  **SimpleReverseETL SQL Server**: host `127.0.0.1`, port `1433`, user `sa`, password
+  `Demo_Passw0rd`, database `DENTAL_RPT`. The tables are in the `dbo` schema.
+- **Transport B load method.** By default SQL Server reads the unloaded files itself with
+  `BULK INSERT`; the demo mounts `_unload_tmp` into the container at `/var/opt/unload` to
+  stand in for a shared folder. To show the client-side method instead, run
+  `export TARGET_MSSQL_LOAD_METHOD=client` before `source demo/target_env.sh`.
+- **Log lines.** Transport B additionally logs one line per file, for example
+  `DENTAL_CLAIMS_STAGED: 20 rows from data_0_0_0.csv (bulk_insert)`.
 
 ---
 
@@ -274,7 +297,7 @@ TablePlus (Cmd+E) and confirm that the two tables are identical:
 ```sql
 SELECT COUNT(*) AS rows_that_differ
 FROM DENTAL_CLAIMS a
-LEFT JOIN DENTAL_CLAIMS_STAGED b USING (CLAIM_ID)
+LEFT JOIN DENTAL_CLAIMS_STAGED b ON b.CLAIM_ID = a.CLAIM_ID
 WHERE b.CLAIM_ID IS NULL
    OR a.CLAIM_STATUS <> b.CLAIM_STATUS
    OR a.AMOUNT <> b.AMOUNT;
@@ -291,7 +314,7 @@ WHERE b.CLAIM_ID IS NULL
 
 The watermark approach needs a reliable `UPDATED_AT` column and cannot see deletes: a row
 deleted in Snowflake simply stops appearing in the query. A Snowflake stream records
-inserts, updates, and deletes without relying on any column. This part loads a third MySQL
+inserts, updates, and deletes without relying on any column. This part loads a third
 table, `DENTAL_CLAIMS_CDC`, from the same source using the stream.
 
 ### Show the pending changes in the stream
@@ -367,7 +390,21 @@ overlap the initial load with the stream.
 
 ### Run the stream synchronization again
 
-Run the same stream command (press the Up arrow).
+Run the same stream command (press the Up arrow), or show that Transport B supports the
+same change capture by running it through the unload path instead:
+
+```bash
+python unload_sync.py --source $SRC --target DENTAL_CLAIMS_CDC \
+    --change-capture stream \
+    --stream SIMPLE_REVERSE_ETL_DEMO.DENTAL.CLAIMS_STREAM \
+    --outbox SIMPLE_REVERSE_ETL_DEMO.DENTAL.CLAIMS_OUTBOX \
+    --mode upsert --key-cols CLAIM_ID \
+    --stage @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE --local-dir _unload_tmp
+```
+
+With Transport B, `LIST @UNLOAD_STAGE` in Snowsight shows two files under
+`dental_claims_cdc/`: `upsert/` with the full row for claim 3, and `delete/` with the key
+of claim 5.
 
 **Expected output:**
 
@@ -434,7 +471,7 @@ Use `SYSTEM$ALLOWLIST()` to get the list of hosts for an account.
 After the presentation, stop MySQL and remove its data:
 
 ```bash
-docker compose -f demo/docker-compose.yml down -v
+docker compose -f demo/docker-compose.yml --profile mssql down -v
 rm -rf sync_state.json sync_state_unload.json _unload_tmp
 ```
 

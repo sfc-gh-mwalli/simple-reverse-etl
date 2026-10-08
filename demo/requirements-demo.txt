@@ -1,4 +1,7 @@
-# Lightweight deps for the MySQL demo (no pyodbc / SQL Server driver needed).
-# secure-local-storage adds keyring so the SSO id-token is cached -> one login popup.
+# Dependencies for the demo scripts.
+# secure-local-storage adds keyring so an SSO id-token can be cached between sessions.
 snowflake-connector-python[pandas,secure-local-storage]>=3.12
 PyMySQL>=1.1
+# SQL Server target (DEMO_TARGET=mssql). The wheel installs without the driver;
+# connecting also needs Microsoft ODBC Driver 18 for SQL Server installed on the OS.
+pyodbc>=5.1

@@ -146,21 +146,53 @@ def consume_stream_to_outbox(conn, stream: str, outbox: str) -> int:
         cur.close()
 
 
-def read_outbox_batches(conn, outbox: str, cutoff_col: str = "_CDC_LOADED_AT"
-                        ) -> Iterator[pd.DataFrame]:
-    """Yield un-exported outbox rows in Arrow batches, oldest first."""
-    query = (
-        f"SELECT * FROM {outbox} WHERE _CDC_EXPORTED = FALSE ORDER BY {cutoff_col}"
+CDC_COLUMNS = ("_CDC_ACTION", "_CDC_ISUPDATE", "_CDC_LOADED_AT", "_CDC_EXPORTED")
+# Exact text form of _CDC_LOADED_AT, so the cutoff round-trips without losing
+# sub-microsecond precision.
+_CUTOFF_FMT = "YYYY-MM-DD HH24:MI:SS.FF9 TZHTZM"
+
+
+def outbox_cutoff(conn, outbox: str) -> str | None:
+    """Snapshot of the newest un-exported outbox row (None if there are none).
+
+    A run reads and acknowledges only rows with _CDC_LOADED_AT <= cutoff, so
+    rows consumed after the snapshot (for example by an overlapping run) stay
+    un-exported and are delivered next time.
+    """
+    return scalar(conn, f"SELECT TO_VARCHAR(MAX(_CDC_LOADED_AT), '{_CUTOFF_FMT}') "
+                        f"FROM {outbox} WHERE _CDC_EXPORTED = FALSE")
+
+
+def build_outbox_changes_query(outbox: str, key_columns) -> str:
+    """Net change per key among un-exported outbox rows up to %(cutoff)s.
+
+    A stream reports an UPDATE as a DELETE row (old values) plus an INSERT row
+    (new values), both with METADATA$ISUPDATE = TRUE; the DELETE half is
+    dropped. The outbox can hold several consumes (e.g. after a failed run), so
+    only the latest change per key is kept. Result: _CDC_ACTION = 'INSERT' rows
+    are upserts, _CDC_ACTION = 'DELETE' rows are deletes, one row per key.
+    """
+    keys = ", ".join(key_columns)
+    return (
+        f"SELECT * FROM {outbox} "
+        f"WHERE _CDC_EXPORTED = FALSE "
+        f"AND _CDC_LOADED_AT <= TO_TIMESTAMP_TZ(%(cutoff)s, '{_CUTOFF_FMT}') "
+        f"AND NOT (_CDC_ACTION = 'DELETE' AND _CDC_ISUPDATE) "
+        f"QUALIFY ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY _CDC_LOADED_AT DESC) = 1"
     )
-    yield from read_query_batches(conn, query)
 
 
-def mark_outbox_exported(conn, outbox: str) -> int:
-    """Mark currently un-exported rows as exported. Call only AFTER the target
-    write for those rows has committed."""
+def mark_outbox_exported(conn, outbox: str, cutoff: str) -> int:
+    """Mark un-exported rows up to `cutoff` as exported. Call only AFTER the
+    target write for those rows has committed."""
     cur = conn.cursor()
     try:
-        cur.execute(f"UPDATE {outbox} SET _CDC_EXPORTED = TRUE WHERE _CDC_EXPORTED = FALSE")
+        cur.execute(
+            f"UPDATE {outbox} SET _CDC_EXPORTED = TRUE "
+            f"WHERE _CDC_EXPORTED = FALSE "
+            f"AND _CDC_LOADED_AT <= TO_TIMESTAMP_TZ(%(cutoff)s, '{_CUTOFF_FMT}')",
+            {"cutoff": cutoff},
+        )
         return cur.rowcount or 0
     finally:
         cur.close()

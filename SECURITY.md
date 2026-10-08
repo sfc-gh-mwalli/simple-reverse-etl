@@ -15,5 +15,5 @@ it responsibly.
   secrets in files.
 - For unattended jobs, use key-pair (RSA) authentication rather than a long-lived
   password or token.
-- The MySQL password in the demo (`demopw`) is a throwaway for a local container only
-  and is never exposed off localhost.
+- The demo passwords (`demopw` for MySQL, `Demo_Passw0rd` for the SQL Server `sa`
+  login) are throwaways for local containers only and are never exposed off localhost.

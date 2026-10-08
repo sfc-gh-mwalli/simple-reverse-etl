@@ -149,45 +149,45 @@ def run_hwm(sf_conn, target, args):
 
 
 def run_stream(sf_conn, target, args):
+    """Stream change capture: stream -> outbox in Snowflake -> target.
+
+    See "Stream-based change capture" in README.md for the full design.
+    """
     if not args.key_cols:
         raise SystemExit("--change-capture stream requires --key-cols")
 
     # 1. Consume the stream into the outbox (this commit advances the offset).
     sf.consume_stream_to_outbox(sf_conn, args.stream, args.outbox)
 
-    # 2. Drain un-exported outbox rows and reduce them to one change per key.
-    #    A stream reports an UPDATE as a DELETE row (old values) plus an INSERT
-    #    row (new values), both with METADATA$ISUPDATE = TRUE. Drop the DELETE
-    #    half so old values are never written. The outbox can hold several
-    #    consumes (e.g. after a failed run), so keep only the latest change per
-    #    key: an INSERT becomes an upsert, a plain DELETE becomes a delete. This
-    #    also guarantees unique keys per batch, which SQL Server's MERGE requires.
-    frames = list(sf.read_outbox_batches(sf_conn, args.outbox))
-    total = deletes = 0
-    if frames:
-        df = pd.concat(frames, ignore_index=True)
-        is_update_before = (df["_CDC_ACTION"] == "DELETE") & df["_CDC_ISUPDATE"].astype(bool)
-        df = df.loc[~is_update_before]
-        df = (df.sort_values("_CDC_LOADED_AT", kind="stable")
-                .drop_duplicates(subset=list(args.key_cols), keep="last"))
+    # 2. Snapshot: handle only outbox rows consumed up to now.
+    cutoff = sf.outbox_cutoff(sf_conn, args.outbox)
+    if cutoff is None:
+        log.info("Stream CDC: no un-exported changes in %s", args.outbox)
+        return
 
+    # 3. Read the net change per key (reduced in Snowflake; see
+    #    build_outbox_changes_query) and apply it in one target transaction.
+    #    Keys are unique across the result, so batches can be applied in turn.
+    frames = sf.read_query_batches(
+        sf_conn, sf.build_outbox_changes_query(args.outbox, args.key_cols),
+        params={"cutoff": cutoff})
+    total = deletes = 0
+    for df in frames:
         data_cols = [c for c in df.columns if c not in CDC_META]
         is_del = df["_CDC_ACTION"] == "DELETE"
         upserts = df.loc[~is_del, data_cols]
-        removes = df.loc[is_del, data_cols]
-
+        removes = df.loc[is_del, list(args.key_cols)]
         if not upserts.empty:
             target.write(args.target, data_cols, _df_to_rows(upserts),
                          mode="upsert", key_columns=args.key_cols)
-            total = len(upserts)
+            total += len(upserts)
         if not removes.empty:
-            key_rows = _df_to_rows(removes[list(args.key_cols)])
-            target.delete(args.target, args.key_cols, key_rows)
-            deletes = len(removes)
+            target.delete(args.target, args.key_cols, _df_to_rows(removes))
+            deletes += len(removes)
     target.commit()
 
-    # 3. Only now is the target write durable -> mark the rows exported.
-    sf.mark_outbox_exported(sf_conn, args.outbox)
+    # 4. Only now is the target write durable -> acknowledge up to the cutoff.
+    sf.mark_outbox_exported(sf_conn, args.outbox, cutoff)
     log.info("Stream CDC complete: %s upserts, %s deletes -> %s",
              total, deletes, args.target)
 

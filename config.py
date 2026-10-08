@@ -59,6 +59,17 @@ class SnowflakeConfig:
         return cfg
 
 
+def _get_bool(name: str, default: bool) -> bool:
+    val = _get(name)
+    if val is None or val == "":
+        return default
+    if val.strip().lower() in ("1", "true", "yes", "y", "on"):
+        return True
+    if val.strip().lower() in ("0", "false", "no", "n", "off"):
+        return False
+    raise RuntimeError(f"{name} must be yes or no, got {val!r}")
+
+
 @dataclass
 class TargetConfig:
     kind: str                   # "mysql" | "mssql"
@@ -67,7 +78,12 @@ class TargetConfig:
     database: str
     user: str
     password: str
-    odbc_driver: str | None     # mssql only
+    # --- SQL Server only -----------------------------------------------------
+    odbc_driver: str | None
+    mssql_encrypt: bool = True              # TLS to SQL Server
+    mssql_trust_server_cert: bool = False   # True skips certificate validation
+    mssql_load_method: str = "bulk_insert"  # Transport B: "bulk_insert" | "client"
+    mssql_bulk_dir: str | None = None       # --local-dir as SQL Server sees it
 
     @classmethod
     def from_env(cls) -> "TargetConfig":
@@ -75,6 +91,10 @@ class TargetConfig:
         if kind not in ("mysql", "mssql"):
             raise RuntimeError(f"TARGET_KIND must be 'mysql' or 'mssql', got {kind!r}")
         default_port = "3306" if kind == "mysql" else "1433"
+        load_method = (_get("TARGET_MSSQL_LOAD_METHOD", "bulk_insert") or "").lower()
+        if load_method not in ("bulk_insert", "client"):
+            raise RuntimeError(
+                f"TARGET_MSSQL_LOAD_METHOD must be 'bulk_insert' or 'client', got {load_method!r}")
         return cls(
             kind=kind,
             host=_get("TARGET_HOST", required=True),
@@ -83,4 +103,8 @@ class TargetConfig:
             user=_get("TARGET_USER", required=True),
             password=_get("TARGET_PASSWORD", required=True),
             odbc_driver=_get("TARGET_ODBC_DRIVER", "ODBC Driver 18 for SQL Server"),
+            mssql_encrypt=_get_bool("TARGET_MSSQL_ENCRYPT", True),
+            mssql_trust_server_cert=_get_bool("TARGET_MSSQL_TRUST_SERVER_CERT", False),
+            mssql_load_method=load_method,
+            mssql_bulk_dir=_get("TARGET_MSSQL_BULK_DIR"),
         )

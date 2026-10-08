@@ -1,97 +1,99 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# End-to-end demo: Snowflake -> local MySQL, showing BOTH transports.
+# Unattended end-to-end demo: Snowflake -> local MySQL or SQL Server.
 #   Source: SIMPLE_REVERSE_ETL_DEMO.DENTAL.DENTAL_CLAIMS
 #
-#   Transport A - live connector pull            (sync.py)         -> DENTAL_CLAIMS
-#   Transport B - unload -> stage -> bulk load   (unload_sync.py)  -> DENTAL_CLAIMS_STAGED
+#   Transport A - connector pull, hwm             (sync.py)        -> DENTAL_CLAIMS
+#   Transport B - unload -> stage -> bulk load    (unload_sync.py) -> DENTAL_CLAIMS_STAGED
+#   Stream CDC  - Transport A, then Transport B   (both)           -> DENTAL_CLAIMS_CDC
 #
-# For each transport: a FULL load (20 rows), then after a mutate (2 updates +
-# 3 inserts) a DELTA upsert (-> 23 rows). Both target tables should end
-# identical, demonstrating the two approaches produce the same result.
+# Watermark part: a full load (20 rows), then after 2 updates + 3 inserts a delta
+# upsert (-> 23 rows) with each transport; both tables must end identical.
+# Stream part: a full load, the same changes through the stream with Transport A,
+# then a delete + update through the stream with Transport B (-> 22 rows,
+# matching Snowflake, with the deleted claim gone).
 #
-# Prereq: Docker Desktop running, and demo/.env.demo filled in
-# (copy demo/.env.demo.example). Runs silently via the stored connection.
+#   ./demo/run_demo.sh                                   # MySQL
+#   DEMO_TARGET=mssql ./demo/run_demo.sh                 # SQL Server, BULK INSERT
+#   DEMO_TARGET=mssql TARGET_MSSQL_LOAD_METHOD=client ./demo/run_demo.sh
+#
+# Prereq: Docker running and demo/.env.demo filled in (see demo/README.md).
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
 DEMO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$DEMO")"
 SRC="SIMPLE_REVERSE_ETL_DEMO.DENTAL.DENTAL_CLAIMS"
-STATE_A="$ROOT/sync_state.json"          # connector transport watermark
-STATE_B="$ROOT/sync_state_unload.json"   # unload transport watermark
-Q="$DEMO/mysql_query.sh"
+STREAM="SIMPLE_REVERSE_ETL_DEMO.DENTAL.CLAIMS_STREAM"
+OUTBOX="SIMPLE_REVERSE_ETL_DEMO.DENTAL.CLAIMS_OUTBOX"
+STAGE="@SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE"
+STATE_A="$ROOT/sync_state.json"          # Transport A watermark
+STATE_B="$ROOT/sync_state_unload.json"   # Transport B watermark
+Q="$DEMO/target_query.sh"
 
 banner() { printf '\n\033[1;36m=== %s ===\033[0m\n' "$1"; }
+fail() { echo "VERIFICATION FAILED: $1" >&2; exit 1; }
+count() { "$Q" "SELECT COUNT(*) AS n FROM $1;" | tail -1 | tr -d '[:space:]'; }
 
-banner "0. Environment"
-set -a; source "$DEMO/.env.demo"; set +a
-if [ -z "${SF_CONNECTION_NAME:-}" ] && [ -z "${SF_PAT:-}" ]; then
-    echo "ERROR: set SF_CONNECTION_NAME or SF_PAT in demo/.env.demo and re-run." >&2
-    exit 1
-fi
-[ -d "$DEMO/.venv" ] || python3 -m venv "$DEMO/.venv"
-# shellcheck disable=SC1091
-source "$DEMO/.venv/bin/activate"
-pip install -q -r "$DEMO/requirements-demo.txt"
+banner "0. Reset ($(printf '%s' "${DEMO_TARGET:-mysql}"))"
+"$DEMO/reset_demo.sh"
+# shellcheck source=demo/target_env.sh
+source "$DEMO/target_env.sh"
+cd "$ROOT"
 
-banner "1. Start MySQL (Docker)"
-docker compose -f "$DEMO/docker-compose.yml" up -d
-printf "waiting for MySQL to be healthy"
-until docker compose -f "$DEMO/docker-compose.yml" exec -T mysql \
-        mysqladmin ping -h localhost -uroot -pdemopw --silent >/dev/null 2>&1; do
-    printf "."; sleep 2
-done
-echo " up."
+A_HWM=(python sync.py --source "$SRC" --target DENTAL_CLAIMS
+       --change-capture hwm --hwm-col UPDATED_AT --mode upsert --key-cols CLAIM_ID
+       --state-file "$STATE_A")
+B_HWM=(python unload_sync.py --source "$SRC" --target DENTAL_CLAIMS_STAGED
+       --change-capture hwm --hwm-col UPDATED_AT --mode upsert --key-cols CLAIM_ID
+       --stage "$STAGE" --state-file "$STATE_B" --local-dir _unload_tmp)
+STREAM_ARGS=(--source "$SRC" --target DENTAL_CLAIMS_CDC --change-capture stream
+             --stream "$STREAM" --outbox "$OUTBOX" --mode upsert --key-cols CLAIM_ID)
 
-banner "2. Reset Snowflake source to 20 rows"
-python "$DEMO/sf_exec.py" --file "$DEMO/setup_snowflake.sql"
-rm -f "$STATE_A" "$STATE_B"
-
-banner "3. FULL load - BOTH transports (from the 20-row baseline)"
-echo "-- Transport A: live connector pull -> DENTAL_CLAIMS"
-python "$ROOT/sync.py" --source "$SRC" --target DENTAL_CLAIMS \
-    --change-capture none --mode truncate --state-file "$STATE_A"
-echo "-- Transport B: unload -> stage -> bulk load -> DENTAL_CLAIMS_STAGED"
-python "$ROOT/unload_sync.py" --source "$SRC" --target DENTAL_CLAIMS_STAGED \
-    --change-capture none --mode truncate --local-dir "$ROOT/_unload_tmp" \
-    --state-file "$STATE_B"
-echo "Row counts after full load (both expect 20):"
+banner "1. Initial load - BOTH transports (no watermark yet: all 20 rows)"
+"${A_HWM[@]}"
+"${B_HWM[@]}"
 "$Q" "SELECT (SELECT COUNT(*) FROM DENTAL_CLAIMS) AS connector_A,
-             (SELECT COUNT(*) FROM DENTAL_CLAIMS_STAGED) AS unload_B;" || true
+             (SELECT COUNT(*) FROM DENTAL_CLAIMS_STAGED) AS unload_B;"
+[ "$(count DENTAL_CLAIMS)" = 20 ] && [ "$(count DENTAL_CLAIMS_STAGED)" = 20 ] \
+    || fail "expected 20 rows in both tables after the initial load"
 
-banner "4. Capture watermark, then mutate Snowflake (2 updates + 3 inserts)"
-WM="$(python "$DEMO/sf_exec.py" --scalar "SELECT MAX(UPDATED_AT) FROM $SRC")"
-echo "watermark = $WM"
-printf '{"%s": {"watermark": "%s"}}\n' "$SRC" "$WM" | tee "$STATE_A" > "$STATE_B"
+banner "2. Mutate Snowflake (2 updates + 3 inserts)"
 python "$DEMO/sf_exec.py" --file "$DEMO/mutate_snowflake.sql"
 
-banner "5. DELTA upsert - BOTH transports (hwm on UPDATED_AT)"
-echo "-- Transport A: connector upsert -> DENTAL_CLAIMS"
-python "$ROOT/sync.py" --source "$SRC" --target DENTAL_CLAIMS \
-    --change-capture hwm --hwm-col UPDATED_AT --mode upsert --key-cols CLAIM_ID \
-    --state-file "$STATE_A"
-echo "-- Transport B: unload + bulk upsert -> DENTAL_CLAIMS_STAGED"
-python "$ROOT/unload_sync.py" --source "$SRC" --target DENTAL_CLAIMS_STAGED \
-    --change-capture hwm --hwm-col UPDATED_AT --mode upsert --key-cols CLAIM_ID \
-    --local-dir "$ROOT/_unload_tmp" --state-file "$STATE_B"
-
-banner "6. Verify - both transports produced the same result"
-echo "Row counts (both expect 23):"
+banner "3. Incremental upsert - BOTH transports (only the 5 changed rows)"
+"${A_HWM[@]}"
+"${B_HWM[@]}"
 "$Q" "SELECT (SELECT COUNT(*) FROM DENTAL_CLAIMS) AS connector_A,
-             (SELECT COUNT(*) FROM DENTAL_CLAIMS_STAGED) AS unload_B;" || true
-echo "Changed/new claims via Transport A (connector):"
+             (SELECT COUNT(*) FROM DENTAL_CLAIMS_STAGED) AS unload_B;"
+echo "Changed/new claims via Transport A, then Transport B:"
 "$Q" "SELECT CLAIM_ID, CLAIM_STATUS, AMOUNT FROM DENTAL_CLAIMS
-      WHERE CLAIM_ID IN (1,2,21,22,23) ORDER BY CLAIM_ID;" || true
-echo "Changed/new claims via Transport B (unload):"
+      WHERE CLAIM_ID IN (1,2,21,22,23) ORDER BY CLAIM_ID;"
 "$Q" "SELECT CLAIM_ID, CLAIM_STATUS, AMOUNT FROM DENTAL_CLAIMS_STAGED
-      WHERE CLAIM_ID IN (1,2,21,22,23) ORDER BY CLAIM_ID;" || true
-echo "Do the two tables match? (expect match=1)"
-"$Q" "SELECT CASE WHEN
-        (SELECT COUNT(*) FROM DENTAL_CLAIMS) =
-        (SELECT COUNT(*) FROM DENTAL_CLAIMS c JOIN DENTAL_CLAIMS_STAGED s USING (CLAIM_ID)
-          WHERE c.CLAIM_STATUS=s.CLAIM_STATUS AND c.AMOUNT=s.AMOUNT)
-      THEN 1 ELSE 0 END AS match_;" || true
+      WHERE CLAIM_ID IN (1,2,21,22,23) ORDER BY CLAIM_ID;"
+DIFF="$("$Q" "SELECT COUNT(*) AS rows_that_differ FROM DENTAL_CLAIMS a
+              LEFT JOIN DENTAL_CLAIMS_STAGED b ON b.CLAIM_ID = a.CLAIM_ID
+              WHERE b.CLAIM_ID IS NULL OR a.CLAIM_STATUS <> b.CLAIM_STATUS
+                 OR a.AMOUNT <> b.AMOUNT OR a.UPDATED_AT <> b.UPDATED_AT;" | tail -1 | tr -d '[:space:]')"
+echo "rows_that_differ = $DIFF"
+[ "$(count DENTAL_CLAIMS)" = 23 ] && [ "$(count DENTAL_CLAIMS_STAGED)" = 23 ] && [ "$DIFF" = 0 ] \
+    || fail "expected 23 identical rows in both tables after the delta"
+
+banner "4. Stream CDC - full load, then the pending stream changes via Transport A"
+python sync.py --source "$SRC" --target DENTAL_CLAIMS_CDC --change-capture none --mode truncate
+python sync.py "${STREAM_ARGS[@]}"
+
+banner "5. Delete claim 5, update claim 3; apply via the stream with Transport B"
+python "$DEMO/sf_exec.py" --file "$DEMO/mutate_snowflake_cdc.sql"
+python unload_sync.py "${STREAM_ARGS[@]}" --stage "$STAGE" --local-dir _unload_tmp
+"$Q" "SELECT CLAIM_ID, CLAIM_STATUS, AMOUNT FROM DENTAL_CLAIMS_CDC
+      WHERE CLAIM_ID IN (3,4,5,6) ORDER BY CLAIM_ID;"
+SF_ROWS="$(python "$DEMO/sf_exec.py" --scalar "SELECT COUNT(*) FROM $SRC")"
+CDC_ROWS="$(count DENTAL_CLAIMS_CDC)"
+HAS5="$(count "DENTAL_CLAIMS_CDC WHERE CLAIM_ID = 5")"
+echo "Snowflake rows = $SF_ROWS, DENTAL_CLAIMS_CDC rows = $CDC_ROWS, claim 5 present = $HAS5"
+[ "$CDC_ROWS" = "$SF_ROWS" ] && [ "$CDC_ROWS" = 22 ] && [ "$HAS5" = 0 ] \
+    || fail "stream target does not match Snowflake"
 
 banner "Choosing a transport"
 cat <<'TXT'
@@ -102,8 +104,10 @@ cat <<'TXT'
                                  large full or incremental loads. The load is
                                  decoupled from Snowflake and can be retried from
                                  the retrieved files.
+  Watermark vs stream:           a watermark needs a reliable UPDATED_AT column and
+                                 cannot see deletes; a stream captures inserts,
+                                 updates, and deletes.
   Network requirements for each option are described in README.md.
 TXT
 
-banner "Done"
-echo "Re-run any time; step 2 resets the source. Stop MySQL: docker compose -f demo/docker-compose.yml down"
+banner "Done: all verifications passed ($DEMO_TARGET)"
