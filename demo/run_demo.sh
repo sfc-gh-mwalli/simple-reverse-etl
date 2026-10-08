@@ -9,9 +9,10 @@
 #
 # Watermark part: a full load (20 rows), then after 2 updates + 3 inserts a delta
 # upsert (-> 23 rows) with each transport; both tables must end identical.
-# Stream part: a full load, the same changes through the stream with Transport A,
-# then a delete + update through the stream with Transport B (-> 22 rows,
-# matching Snowflake, with the deleted claim gone).
+# Stream part: create the stream and outbox, full load (23 rows), then a delete +
+# update through the stream with Transport A (-> 22 rows, claim 5 gone), then an
+# insert + update with Transport B (-> 23 rows); the target must match Snowflake.
+# Snowflake steps run the same [Sn] sections of snowsight_demo.sql the presenter uses.
 #
 #   ./demo/run_demo.sh                                   # MySQL
 #   DEMO_TARGET=mssql ./demo/run_demo.sh                 # SQL Server, BULK INSERT
@@ -59,7 +60,7 @@ banner "1. Initial load - BOTH transports (no watermark yet: all 20 rows)"
     || fail "expected 20 rows in both tables after the initial load"
 
 banner "2. Mutate Snowflake (2 updates + 3 inserts)"
-python "$DEMO/sf_exec.py" --file "$DEMO/mutate_snowflake.sql"
+python "$DEMO/sf_exec.py" --section S2
 
 banner "3. Incremental upsert - BOTH transports (only the 5 changed rows)"
 "${A_HWM[@]}"
@@ -79,20 +80,29 @@ echo "rows_that_differ = $DIFF"
 [ "$(count DENTAL_CLAIMS)" = 23 ] && [ "$(count DENTAL_CLAIMS_STAGED)" = 23 ] && [ "$DIFF" = 0 ] \
     || fail "expected 23 identical rows in both tables after the delta"
 
-banner "4. Stream CDC - full load, then the pending stream changes via Transport A"
+banner "4. Stream CDC - create the stream and outbox ([S5]), then the initial full load"
+python "$DEMO/sf_exec.py" --section S5
 python sync.py --source "$SRC" --target DENTAL_CLAIMS_CDC --change-capture none --mode truncate
-python sync.py "${STREAM_ARGS[@]}"
+[ "$(count DENTAL_CLAIMS_CDC)" = 23 ] || fail "expected 23 rows after the CDC full load"
 
-banner "5. Delete claim 5, update claim 3; apply via the stream with Transport B"
-python "$DEMO/sf_exec.py" --file "$DEMO/mutate_snowflake_cdc.sql"
+banner "5. Delete claim 5, update claim 3 ([S6]); apply via the stream with Transport A"
+python "$DEMO/sf_exec.py" --section S6
+python sync.py "${STREAM_ARGS[@]}"
+[ "$(count DENTAL_CLAIMS_CDC)" = 22 ] && [ "$(count "DENTAL_CLAIMS_CDC WHERE CLAIM_ID = 5")" = 0 ] \
+    && [ "$(count "DENTAL_CLAIMS_CDC WHERE CLAIM_ID = 3 AND CLAIM_STATUS = 'PAID'")" = 1 ] \
+    || fail "expected claim 5 deleted and claim 3 PAID after the Transport A stream run"
+
+banner "6. Insert claim 24, update claim 4 ([S7]); apply via the stream with Transport B"
+python "$DEMO/sf_exec.py" --section S7
 python sync.py --transport unload "${STREAM_ARGS[@]}" --stage "$STAGE" --local-dir _unload_tmp
 "$Q" "SELECT CLAIM_ID, CLAIM_STATUS, AMOUNT FROM DENTAL_CLAIMS_CDC
-      WHERE CLAIM_ID IN (3,4,5,6) ORDER BY CLAIM_ID;"
+      WHERE CLAIM_ID IN (3,4,5,24) ORDER BY CLAIM_ID;"
 SF_ROWS="$(python "$DEMO/sf_exec.py" --scalar "SELECT COUNT(*) FROM $SRC")"
 CDC_ROWS="$(count DENTAL_CLAIMS_CDC)"
 HAS5="$(count "DENTAL_CLAIMS_CDC WHERE CLAIM_ID = 5")"
-echo "Snowflake rows = $SF_ROWS, DENTAL_CLAIMS_CDC rows = $CDC_ROWS, claim 5 present = $HAS5"
-[ "$CDC_ROWS" = "$SF_ROWS" ] && [ "$CDC_ROWS" = 22 ] && [ "$HAS5" = 0 ] \
+HAS24="$(count "DENTAL_CLAIMS_CDC WHERE CLAIM_ID = 24")"
+echo "Snowflake rows = $SF_ROWS, DENTAL_CLAIMS_CDC rows = $CDC_ROWS, claim 5 present = $HAS5, claim 24 present = $HAS24"
+[ "$CDC_ROWS" = "$SF_ROWS" ] && [ "$CDC_ROWS" = 23 ] && [ "$HAS5" = 0 ] && [ "$HAS24" = 1 ] \
     || fail "stream target does not match Snowflake"
 OUTBOX_ROWS="$(python "$DEMO/sf_exec.py" --scalar "SELECT COUNT(*) FROM $OUTBOX")"
 echo "Outbox rows after delivery = $OUTBOX_ROWS (default: delivered rows are deleted)"

@@ -3,8 +3,8 @@
 # Resets the demonstration to its starting state:
 #   - starts the target container (MySQL, or SQL Server with DEMO_TARGET=mssql),
 #     creates any missing target tables, and empties all three
-#   - recreates the Snowflake source with 20 rows, its stream and outbox, and
-#     empties the demo stage
+#   - recreates the Snowflake source with 20 rows, drops the stream and
+#     outbox (created live in Part 5), and empties the demo stage
 #   - removes local watermark state and previously retrieved files
 # Safe to run repeatedly. Requires Docker running and demo/.env.demo.
 #
@@ -23,7 +23,7 @@ demo_start_target
 demo_init_target
 "$DEMO/target_query.sh" "TRUNCATE TABLE DENTAL_CLAIMS; TRUNCATE TABLE DENTAL_CLAIMS_STAGED; TRUNCATE TABLE DENTAL_CLAIMS_CDC;" >/dev/null
 
-echo "Resetting Snowflake source, stream, outbox, and stage..."
+echo "Resetting Snowflake source and stage; dropping the stream and outbox..."
 python "$DEMO/sf_exec.py" --file "$DEMO/setup_snowflake.sql"
 
 rm -f "$ROOT/sync_state.json" "$ROOT/sync_state_unload.json"
@@ -31,4 +31,4 @@ rm -f "$ROOT/sync_state.json" "$ROOT/sync_state_unload.json"
 mkdir -p "$ROOT/_unload_tmp"
 find "$ROOT/_unload_tmp" -mindepth 1 -delete
 
-echo "Reset complete ($DEMO_TARGET): Snowflake source has 20 rows; stream, outbox, stage, and target tables are empty."
+echo "Reset complete ($DEMO_TARGET): Snowflake source has 20 rows; no stream or outbox yet; stage and target tables are empty."

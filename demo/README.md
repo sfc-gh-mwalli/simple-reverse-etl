@@ -59,7 +59,7 @@ Part 5 (stream-based change capture). Part 5 can be skipped.
 
 4. **Snowsight.** Open a new SQL worksheet, paste in the contents of
    [demo/snowsight_demo.sql](snowsight_demo.sql), and set the worksheet role and warehouse
-   to match `demo/.env.demo`. Each section of the worksheet is labeled `[S1]` to `[S7]`.
+   to match `demo/.env.demo`. Each section of the worksheet is labeled `[S1]` to `[S8]`.
    The worksheet references objects created by the reset step, so run the reset once
    before using it.
 
@@ -82,8 +82,9 @@ The reset script:
 
 - starts the target container, creates any missing target tables, and empties
   `DENTAL_CLAIMS`, `DENTAL_CLAIMS_STAGED`, and `DENTAL_CLAIMS_CDC`
-- recreates the Snowflake source with 20 rows, recreates the stream `CLAIMS_STREAM` and the
-  outbox table `CLAIMS_OUTBOX`, and creates and empties the stage `UNLOAD_STAGE`
+- recreates the Snowflake source with 20 rows, creates and empties the stage
+  `UNLOAD_STAGE`, and drops the stream `CLAIMS_STREAM` and the outbox `CLAIMS_OUTBOX`,
+  which you create live in Part 5
 - removes the local watermark files and any previously retrieved files
 
 Then prepare the terminal session that you will present from. This loads the Snowflake
@@ -329,27 +330,34 @@ WHERE b.CLAIM_ID IS NULL
 
 The watermark approach needs a reliable `UPDATED_AT` column and cannot see deletes: a row
 deleted in Snowflake simply stops appearing in the query. A Snowflake stream records
-inserts, updates, and deletes without relying on any column. This part loads a third
-table, `DENTAL_CLAIMS_CDC`, from the same source using the stream.
+inserts, updates, and deletes without relying on any column. This part sets up a stream,
+loads a third table, `DENTAL_CLAIMS_CDC`, and then applies a delete, updates, and an
+insert through the stream, once with each transport.
 
-### Show the pending changes in the stream
+### Set up the stream
 
-The reset created `CLAIMS_STREAM` right after seeding the source, so it has been recording
-every change since, including the ones made in `[S2]`.
+**Snowsight: run `[S5]`.** This is the one-time setup, the demo version of
+[sql/01_snowflake_setup.sql](../sql/01_snowflake_setup.sql):
 
-**Snowsight: run `[S5]`.**
+- `ALTER TABLE ... SET CHANGE_TRACKING = TRUE` enables change tracking on the source.
+- `CREATE STREAM CLAIMS_STREAM` creates a standard stream. It starts empty, and
+  `SYSTEM$STREAM_HAS_DATA` returns `FALSE`.
+- `CREATE TRANSIENT TABLE CLAIMS_OUTBOX` creates the outbox: the source columns in the
+  same order, followed by four `_CDC_*` columns.
+- `SHOW STREAMS` shows the stream's `MODE` and `STALE_AFTER`.
 
-- Claims 21, 22, and 23 appear once, as `INSERT` with `METADATA$ISUPDATE = FALSE`.
-- Claims 1 and 2 each appear twice, with `METADATA$ISUPDATE = TRUE`: a `DELETE` row with
-  the old values and an `INSERT` row with the new values. This is how a stream reports an
-  update.
-- Selecting from the stream does not consume it. `SYSTEM$STREAM_HAS_DATA` returns `TRUE`.
+**Talking points**
+
+- The order matters: create the stream first, then run the initial full load, so no change
+  made in between is missed. A change made between the two is simply applied again by the
+  first stream run, which is harmless.
+- The outbox is transient because it is short-lived working data; Fail-safe storage would
+  add cost without a recovery benefit.
 
 ### Code walkthrough
 
 | File | What to show |
 |---|---|
-| [sql/01_snowflake_setup.sql](../sql/01_snowflake_setup.sql) | One-time setup: change tracking, the stream, and the outbox table. The demo versions are at the end of [setup_snowflake.sql](setup_snowflake.sql). |
 | [snowflake_source.py](../snowflake_source.py#L122) `consume_stream_to_outbox()` | `INSERT INTO outbox SELECT ... FROM stream` in one transaction. Committing it advances the stream offset; the changes are now held in the outbox. |
 | [change_capture.py](../change_capture.py#L142) `plan_stream()` | Consumes the stream, snapshots the cutoff, and plans two queries: rows to upsert and keys to delete. |
 | [snowflake_source.py](../snowflake_source.py#L166) `build_outbox_changes_query()` | Runs in Snowflake: drops the old-value half of each update and keeps the latest change per key (`QUALIFY ROW_NUMBER()`). |
@@ -375,7 +383,21 @@ python sync.py --source $SRC --target DENTAL_CLAIMS_CDC \
 
 **Expected output:** `Full load complete: 23 rows -> DENTAL_CLAIMS_CDC`
 
-### Run the stream synchronization
+**TablePlus:** refresh `DENTAL_CLAIMS_CDC`. It contains the same 23 rows as the other two
+tables.
+
+### Delete and update in Snowflake
+
+**Snowsight: run `[S6]`.**
+
+- Claim 5 is deleted.
+- Claim 3 changes from `DENIED` to `PAID`, and its amount increases by 50.
+- The stream query shows exactly three rows: a `DELETE` for claim 5 with
+  `METADATA$ISUPDATE = FALSE`, and an update pair for claim 3 (a `DELETE` with the old
+  values and an `INSERT` with the new values, both with `METADATA$ISUPDATE = TRUE`).
+- Selecting from the stream does not consume it. `SYSTEM$STREAM_HAS_DATA` returns `TRUE`.
+
+### Apply the changes with Transport A
 
 ```bash
 python sync.py --source $SRC --target DENTAL_CLAIMS_CDC \
@@ -388,30 +410,31 @@ python sync.py --source $SRC --target DENTAL_CLAIMS_CDC \
 
 **Expected output:**
 
-- `Consumed 7 change rows from ... CLAIMS_STREAM into ... CLAIMS_OUTBOX`
+- `Consumed 3 change rows from ... CLAIMS_STREAM into ... CLAIMS_OUTBOX`
 - `Purged 0 delivered row(s) from ... CLAIMS_OUTBOX (retention 1 day(s))`
-- `Stream CDC complete: 5 upserts, 0 deletes -> DENTAL_CLAIMS_CDC`
+- `Stream CDC complete: 1 upserts, 1 deletes -> DENTAL_CLAIMS_CDC`
 
-The full load already contained these five changes, because they were made before it ran.
-Applying them again leaves the table unchanged, which illustrates why it is safe to
-overlap the initial load with the stream.
+The three stream rows became one upsert (claim 3, new values only) and one delete
+(claim 5).
 
-**Snowsight: run the `[S5]` queries again.** The stream is now empty, and
-`SYSTEM$STREAM_HAS_DATA` returns `FALSE`.
+**TablePlus:** refresh `DENTAL_CLAIMS_CDC`.
 
-### Delete and update in Snowflake
+- It contains 22 rows. Claim 5 is gone, and claim 3 shows `PAID`.
+- Compare with `DENTAL_CLAIMS`, which was loaded with the watermark: claim 5 is still
+  there. A watermark cannot detect deletes, and claim 3 is unchanged there until the next
+  watermark run.
 
-**Snowsight: run `[S6]`.**
+**Snowsight:** run the stream query from `[S6]` again. The stream is now empty.
 
-- Claim 5 is deleted.
-- Claim 3 changes from `DENIED` to `PAID`, and its amount increases by 50.
-- The final query shows exactly three stream rows: a `DELETE` for claim 5 with
-  `METADATA$ISUPDATE = FALSE`, and an update pair for claim 3.
+### Insert and update in Snowflake
 
-### Run the stream synchronization again
+**Snowsight: run `[S7]`.** Claim 24 is inserted, and claim 4 is set to `PAID` with its
+amount increased by 25. The stream query shows one `INSERT` for claim 24 and an update
+pair for claim 4.
 
-Run the same stream command (press the Up arrow), or show that Transport B supports the
-same change capture by running it through the unload path instead:
+### Apply the changes with Transport B
+
+The same stream change capture works through the unload path:
 
 ```bash
 python sync.py --transport unload --source $SRC --target DENTAL_CLAIMS_CDC \
@@ -423,32 +446,29 @@ python sync.py --transport unload --source $SRC --target DENTAL_CLAIMS_CDC \
     --stage @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE --local-dir _unload_tmp
 ```
 
-With Transport B, `LIST @UNLOAD_STAGE` in Snowsight shows two files under
-`dental_claims_cdc/`: `upsert/` with the full row for claim 3, and `delete/` with the key
-of claim 5.
-
 **Expected output:**
 
 - `Consumed 3 change rows`
-- `Stream CDC complete: 1 upserts, 1 deletes -> DENTAL_CLAIMS_CDC`
+- `Unloaded 2 rows to @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE/dental_claims_cdc/upsert/`
+- `Unloaded 0 rows to .../dental_claims_cdc/delete/` (this run has no deletes)
+- `Stream CDC complete: 2 upserts, 0 deletes -> DENTAL_CLAIMS_CDC`
 
-**TablePlus:** refresh `DENTAL_CLAIMS_CDC`.
+**Snowsight: run `[S3]`.** `LIST @UNLOAD_STAGE` shows a file under `dental_claims_cdc/upsert/`
+with the rows for claims 4 and 24. When a run includes deletes, a file with the deleted
+keys appears under `dental_claims_cdc/delete/` as well.
 
-- It contains 22 rows, matching Snowflake. Claim 5 is gone, and claim 3 shows `PAID`.
-- Compare with `DENTAL_CLAIMS`, which was loaded with the watermark: claim 5 is still
-  there. A watermark cannot detect deletes, and claim 3 is unchanged there until the next
-  watermark run.
+**TablePlus:** refresh `DENTAL_CLAIMS_CDC`. It contains 23 rows, matching Snowflake: claim
+24 is present, claim 4 shows `PAID`, and claim 5 is still gone.
 
 ### Show the outbox
 
-**Snowsight: run `[S7]`.** The outbox lists every change consumed by the two runs, grouped
-by `_CDC_LOADED_AT`, with `_CDC_EXPORTED = TRUE` for all rows. Each update appears as its
-`DELETE` and `INSERT` halves.
+**Snowsight: run `[S8]`.** The outbox lists the six changes consumed by the two runs,
+grouped by `_CDC_LOADED_AT`, with `_CDC_EXPORTED = TRUE` for all rows. Each update appears
+as its `DELETE` and `INSERT` halves.
 
 **Talking point:** the demo commands pass `--outbox-retention-days 1` so these delivered
 rows stay visible. By default the job deletes delivered rows right after each successful
-run, so in production the outbox only holds changes that have not been delivered yet. It
-is a transient table, so it also carries no Fail-safe storage cost.
+run, so in production the outbox only holds changes that have not been delivered yet.
 
 Optionally, run the stream command once more. It reports `Consumed 0 change rows` and
 `Stream CDC: no un-exported changes`.
@@ -488,9 +508,10 @@ Use `SYSTEM$ALLOWLIST()` to get the list of hosts for an account.
 | Snowflake authentication prompt or failure | Check `demo/.env.demo`. Test the connection with `snow connection test -c <connection name>`. |
 | `$SRC` is empty | Run the three terminal preparation commands from [Reset before each presentation](#reset-before-each-presentation) in the current terminal. |
 | TablePlus shows old data | Refresh the table with Cmd+R. |
-| Snowsight reports that `UNLOAD_STAGE`, `UNLOAD_CSV`, `CLAIMS_STREAM`, or `CLAIMS_OUTBOX` does not exist | Run `./demo/reset_demo.sh`. It creates these objects. |
-| Stream run reports `Consumed 0 change rows` unexpectedly | The changes were already consumed by an earlier run. Run `[S6]` again with a different claim, or reset the demo. |
-| Stream run fails because the stream is stale or its source table was replaced | Run `./demo/reset_demo.sh`, which recreates the source table and the stream together. |
+| Snowsight reports that `UNLOAD_STAGE` or `UNLOAD_CSV` does not exist | Run `./demo/reset_demo.sh`. It creates these objects. |
+| Snowsight or a stream run reports that `CLAIMS_STREAM` or `CLAIMS_OUTBOX` does not exist | Run `[S5]`. The reset drops both so that they can be created live in Part 5. |
+| Stream run reports `Consumed 0 change rows` unexpectedly | The changes were already consumed by an earlier run, or were made before `[S5]` created the stream. Make another change in Snowsight, or reset the demo. |
+| Stream run fails because the stream is stale or its source table was replaced | Run `./demo/reset_demo.sh`, then `[S5]`, and start Part 5 again. |
 | TablePlus cannot connect | Use host `127.0.0.1`, not `localhost`, confirm the container is running with `docker ps`, and check that the connection type matches the target (MySQL on 3306, SQL Server on 1433). |
 | SQL Server: `Login failed` or connection refused right after a reset | SQL Server is still starting under emulation. Wait a minute and retry. |
 | SQL Server: `Can't open lib 'ODBC Driver 18 for SQL Server'` or an OpenSSL load error | Install the driver (`brew tap microsoft/mssql-release && brew install msodbcsql18`). On macOS with `openssl@4` installed, point `/opt/homebrew/opt/openssl` at `openssl@3`; see [SQL Server targets](../README.md#sql-server-targets). |

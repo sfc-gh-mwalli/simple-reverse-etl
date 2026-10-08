@@ -44,17 +44,34 @@ SELECT START_TIME, QUERY_TYPE, ROWS_PRODUCED, LEFT(QUERY_TEXT, 120) AS QUERY_TEX
    AND START_TIME > DATEADD('hour', -1, CURRENT_TIMESTAMP())
  ORDER BY START_TIME DESC;
 
--- [S5] Pending changes in the stream -----------------------------------------
--- Selecting from a stream does not consume it. An UPDATE appears as two rows:
--- METADATA$ACTION = 'DELETE' (old values) and 'INSERT' (new values), both with
--- METADATA$ISUPDATE = TRUE.
-SELECT METADATA$ACTION, METADATA$ISUPDATE, CLAIM_ID, CLAIM_STATUS, AMOUNT, UPDATED_AT
-  FROM CLAIMS_STREAM
- ORDER BY CLAIM_ID, METADATA$ACTION;
+-- [S5] One-time setup: change tracking, stream, outbox ------------------------
+-- Demo version of sql/01_snowflake_setup.sql, the production template.
+-- Create the stream first, then run the initial full load, so no change made
+-- in between is missed. A new stream starts empty.
+ALTER TABLE DENTAL_CLAIMS SET CHANGE_TRACKING = TRUE;
 
-SELECT SYSTEM$STREAM_HAS_DATA('CLAIMS_STREAM') AS STREAM_HAS_DATA;
+CREATE OR REPLACE STREAM CLAIMS_STREAM ON TABLE DENTAL_CLAIMS;
 
--- [S6] More upstream changes: one delete and one update ----------------------
+-- Outbox: source columns in the same order, then four CDC columns. Transient,
+-- because it is short-lived working data.
+CREATE OR REPLACE TRANSIENT TABLE CLAIMS_OUTBOX (
+    CLAIM_ID       NUMBER        NOT NULL,
+    MEMBER_ID      NUMBER,
+    CLAIM_STATUS   VARCHAR(20),
+    AMOUNT         NUMBER(10,2),
+    UPDATED_AT     TIMESTAMP_NTZ,
+    _CDC_ACTION    STRING,
+    _CDC_ISUPDATE  BOOLEAN,
+    _CDC_LOADED_AT TIMESTAMP_LTZ,
+    _CDC_EXPORTED  BOOLEAN DEFAULT FALSE
+)
+DATA_RETENTION_TIME_IN_DAYS = 1;
+
+SHOW STREAMS LIKE 'CLAIMS_STREAM';           -- MODE = DEFAULT; note STALE_AFTER
+
+SELECT SYSTEM$STREAM_HAS_DATA('CLAIMS_STREAM') AS STREAM_HAS_DATA;   -- FALSE
+
+-- [S6] Upstream changes: delete claim 5, update claim 3 ----------------------
 DELETE FROM DENTAL_CLAIMS WHERE CLAIM_ID = 5;
 
 -- Claim 3 is seeded as DENIED; approve it and adjust the amount.
@@ -64,12 +81,30 @@ UPDATE DENTAL_CLAIMS
        UPDATED_AT   = CURRENT_TIMESTAMP()
  WHERE CLAIM_ID = 3;
 
--- The stream now holds exactly these changes
+-- Pending changes in the stream. Selecting does not consume them. An UPDATE
+-- appears as two rows: METADATA$ACTION = 'DELETE' (old values) and 'INSERT'
+-- (new values), both with METADATA$ISUPDATE = TRUE.
 SELECT METADATA$ACTION, METADATA$ISUPDATE, CLAIM_ID, CLAIM_STATUS, AMOUNT
   FROM CLAIMS_STREAM
  ORDER BY CLAIM_ID, METADATA$ACTION;
 
--- [S7] Outbox: every change the job has consumed, and whether it was delivered
+SELECT SYSTEM$STREAM_HAS_DATA('CLAIMS_STREAM') AS STREAM_HAS_DATA;   -- TRUE
+
+-- [S7] More upstream changes: insert claim 24, update claim 4 ----------------
+INSERT INTO DENTAL_CLAIMS (CLAIM_ID, MEMBER_ID, CLAIM_STATUS, AMOUNT, UPDATED_AT)
+VALUES (24, 88888, 'SUBMITTED', 432.10, CURRENT_TIMESTAMP());
+
+UPDATE DENTAL_CLAIMS
+   SET CLAIM_STATUS = 'PAID',
+       AMOUNT       = AMOUNT + 25.00,
+       UPDATED_AT   = CURRENT_TIMESTAMP()
+ WHERE CLAIM_ID = 4;
+
+SELECT METADATA$ACTION, METADATA$ISUPDATE, CLAIM_ID, CLAIM_STATUS, AMOUNT
+  FROM CLAIMS_STREAM
+ ORDER BY CLAIM_ID, METADATA$ACTION;
+
+-- [S8] Outbox: every change the job has consumed, and whether it was delivered
 SELECT _CDC_LOADED_AT, _CDC_ACTION, _CDC_ISUPDATE, _CDC_EXPORTED,
        CLAIM_ID, CLAIM_STATUS, AMOUNT
   FROM CLAIMS_OUTBOX

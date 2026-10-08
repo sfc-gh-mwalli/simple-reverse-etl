@@ -30,24 +30,8 @@ SELECT
     DATEADD('minute', -1 * UNIFORM(0, 20000, RANDOM()), CURRENT_TIMESTAMP()) AS UPDATED_AT
 FROM TABLE(GENERATOR(ROWCOUNT => 20));
 
--- Stream-based change capture (sync.py --change-capture stream).
--- The stream is created after the seed rows are inserted, so it starts empty and
--- records only later changes. Recreating the table above invalidates any older
--- stream, so both objects are recreated on every reset.
-CREATE OR REPLACE STREAM SIMPLE_REVERSE_ETL_DEMO.DENTAL.CLAIMS_STREAM
-    ON TABLE SIMPLE_REVERSE_ETL_DEMO.DENTAL.DENTAL_CLAIMS;
-
--- Outbox: the source columns in the same order, then four CDC columns.
--- Transient: short-lived working data, no Fail-safe (see sql/01_snowflake_setup.sql).
-CREATE OR REPLACE TRANSIENT TABLE SIMPLE_REVERSE_ETL_DEMO.DENTAL.CLAIMS_OUTBOX (
-    CLAIM_ID       NUMBER        NOT NULL,
-    MEMBER_ID      NUMBER,
-    CLAIM_STATUS   VARCHAR(20),
-    AMOUNT         NUMBER(10,2),
-    UPDATED_AT     TIMESTAMP_NTZ,
-    _CDC_ACTION    STRING,
-    _CDC_ISUPDATE  BOOLEAN,
-    _CDC_LOADED_AT TIMESTAMP_LTZ,
-    _CDC_EXPORTED  BOOLEAN DEFAULT FALSE
-)
-DATA_RETENTION_TIME_IN_DAYS = 1;
+-- The stream and outbox are created live in Part 5 of the runbook
+-- (snowsight_demo.sql [S5]), so a reset removes them. Recreating the table
+-- above would invalidate the stream anyway.
+DROP STREAM IF EXISTS SIMPLE_REVERSE_ETL_DEMO.DENTAL.CLAIMS_STREAM;
+DROP TABLE IF EXISTS SIMPLE_REVERSE_ETL_DEMO.DENTAL.CLAIMS_OUTBOX;
