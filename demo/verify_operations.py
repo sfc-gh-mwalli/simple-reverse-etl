@@ -4,9 +4,12 @@
   lock       a second run for the same target exits 3 while the first holds the lock
   query_tag  the job's Snowflake queries carry QUERY_TAG simple-reverse-etl:<target>
   timeout    SF_STATEMENT_TIMEOUT_SECONDS cancels a long Snowflake statement
-  exit_codes invalid options exit 2 before connecting
-  mysql_tls  (MySQL only) with TARGET_MYSQL_SSL_CA the server certificate is
-             verified: the demo CA is accepted, a wrong CA is rejected
+  exit_codes invalid options exit 2 before connecting; hwm with --mode append is rejected
+  files      Transport B deletes its stage and local files after a successful run,
+             keeps them with --keep-files, and keeps them after a failed run
+  mysql_tls  (MySQL only) a verified server certificate is required by default:
+             no CA is refused, the demo CA is accepted, a wrong CA is rejected,
+             and TARGET_MYSQL_SSL_VERIFY=no connects without verifying
 
   DEMO_TARGET=mysql ./demo/verify_operations.sh
   DEMO_TARGET=mssql ./demo/verify_operations.sh
@@ -18,6 +21,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -82,7 +86,12 @@ def main() -> int:
         results.append(check("timeout", "timeout of 2 second" in msg, msg[:90]))
 
         rc = sync.main(["--source", "X", "--target", "T; DROP TABLE T"])
-        results.append(check("exit_codes", rc == sync.EXIT_USAGE, f"invalid name exit {rc}"))
+        rc_append = sync.main(["--source", SRC, "--target", TABLE, "--change-capture", "hwm",
+                               "--hwm-col", "ID", "--mode", "append"])
+        results.append(check("exit_codes", rc == rc_append == sync.EXIT_USAGE,
+                             f"invalid name exit {rc}; hwm with append exit {rc_append}"))
+
+        results.append(check_files(cur))
 
         if tcfg.kind == "mysql":
             results.append(check_mysql_tls(tcfg))
@@ -95,6 +104,32 @@ def main() -> int:
         conn.close()
     print("RESULT:", "all passed" if all(results) else "failures")
     return 0 if all(results) else 1
+
+
+def check_files(cur) -> bool:
+    stage = "@SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE"
+    local = os.path.join(ROOT, "_unload_tmp")
+    unload = FULL + ["--transport", "unload", "--stage", stage, "--local-dir", local]
+
+    def present():
+        cur.execute(f"LIST {stage}/{TABLE.lower()}/")
+        on_stage = len(cur.fetchall())
+        on_disk = sum(len(f) for _, _, f in os.walk(local))
+        return on_stage, on_disk
+
+    out = {}
+    out["success"] = (sync.main(unload), *present())
+    out["--keep-files"] = (sync.main(unload + ["--keep-files"]), *present())
+    with mock.patch.object(targets.MySQLTarget, "bulk_load", side_effect=RuntimeError("x")), \
+         mock.patch.object(targets.MSSQLTarget, "bulk_load", side_effect=RuntimeError("x")):
+        out["failed"] = (sync.main(unload), *present())
+    sync.main(unload)                                  # leave nothing behind
+    ok = (out["success"] == (0, 0, 0)
+          and out["--keep-files"][0] == 0 and min(out["--keep-files"][1:]) > 0
+          and out["failed"][0] == 1 and min(out["failed"][1:]) > 0)
+    detail = "; ".join(f"{k}: exit {v[0]}, {v[1]} stage / {v[2]} local files"
+                       for k, v in out.items())
+    return check("files", ok, detail)
 
 
 def check_mysql_tls(tcfg) -> bool:
@@ -110,8 +145,12 @@ def check_mysql_tls(tcfg) -> bool:
                     os.path.join(tmp, "k.pem"), "-out", wrong, "-days", "1", "-subj", "/CN=wrong"],
                    check=True, capture_output=True)
     outcome = {}
-    for label, ca in (("demo CA", good), ("wrong CA", wrong)):
-        tcfg.mysql_ssl_ca, tcfg.mysql_ssl_verify_identity = ca, False
+    saved = (tcfg.mysql_ssl_ca, tcfg.mysql_ssl_verify, tcfg.mysql_ssl_verify_identity)
+    cases = (("no CA", None, True), ("demo CA", good, True), ("wrong CA", wrong, True),
+             ("verify=no", None, False))
+    for label, ca, verify in cases:
+        tcfg.mysql_ssl_ca, tcfg.mysql_ssl_verify = ca, verify
+        tcfg.mysql_ssl_verify_identity = False
         try:
             t = targets.make_target(tcfg)
             with t.conn.cursor() as cur:
@@ -120,9 +159,11 @@ def check_mysql_tls(tcfg) -> bool:
             t.close()
         except Exception as exc:  # noqa: BLE001
             outcome[label] = f"rejected ({type(exc).__name__})"
-    tcfg.mysql_ssl_ca = None
-    ok = outcome["demo CA"].startswith("connected") and outcome["wrong CA"].startswith("rejected")
-    return check("mysql_tls", ok, f"demo CA: {outcome['demo CA']}; wrong CA: {outcome['wrong CA']}")
+    tcfg.mysql_ssl_ca, tcfg.mysql_ssl_verify, tcfg.mysql_ssl_verify_identity = saved
+    ok = (outcome["no CA"].startswith("rejected") and outcome["demo CA"].startswith("connected")
+          and outcome["wrong CA"].startswith("rejected")
+          and outcome["verify=no"].startswith("connected"))
+    return check("mysql_tls", ok, "; ".join(f"{k}: {v}" for k, v in outcome.items()))
 
 
 if __name__ == "__main__":

@@ -24,3 +24,6 @@ _unload_tmp/
 
 # OS
 .DS_Store
+
+# Demo MySQL CA certificate (copied from the container by demo/target_env.sh)
+demo/.mysql-demo-ca.pem

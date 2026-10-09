@@ -22,6 +22,11 @@ set -a; source "$DEMO/.env.demo"; set +a
 case "$DEMO_TARGET" in
   mysql)
     DEMO_SERVICE=mysql
+    # The job requires a verified server certificate. The demo container
+    # generates its own CA (copied out by demo_mysql_ca); its certificate is not
+    # issued for 127.0.0.1, so host-name checking is off for the demo only.
+    export TARGET_MYSQL_SSL_CA="$DEMO/.mysql-demo-ca.pem" \
+           TARGET_MYSQL_SSL_VERIFY_IDENTITY=no
     ;;
   mssql)
     DEMO_SERVICE=mssql
@@ -45,6 +50,13 @@ export DEMO_TARGET
 source "$DEMO/.venv/bin/activate"
 pip install -q --disable-pip-version-check -r "$DEMO/requirements-demo.txt"
 
+demo_mysql_ca() {
+    # Copy the running MySQL container's CA certificate for TARGET_MYSQL_SSL_CA.
+    [ "$DEMO_TARGET" = mysql ] || return 0
+    docker cp simple-reverse-etl-demo-mysql:/var/lib/mysql/ca.pem \
+        "$TARGET_MYSQL_SSL_CA" >/dev/null 2>&1 || true
+}
+
 demo_start_target() {
     # The SQL Server container mounts --local-dir; create it first so Docker
     # does not create it as root.
@@ -55,7 +67,7 @@ demo_start_target() {
     for _ in $(seq 1 90); do
         status="$(docker inspect -f '{{.State.Health.Status}}' \
                   "simple-reverse-etl-demo-$DEMO_SERVICE" 2>/dev/null || true)"
-        [ "$status" = "healthy" ] && { echo " ready."; return 0; }
+        [ "$status" = "healthy" ] && { echo " ready."; demo_mysql_ca; return 0; }
         printf "."; sleep 2
     done
     echo " not healthy (status: ${status:-unknown})." >&2
@@ -73,3 +85,6 @@ demo_init_target() {
             < "$DEMO/mssql_init.sql" >/dev/null
     fi
 }
+
+# Scripts that do not start the container still need the CA file.
+demo_mysql_ca

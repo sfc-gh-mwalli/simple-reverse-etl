@@ -46,11 +46,20 @@ class MySQLTarget:
         import pymysql
 
         # TLS: PyMySQL negotiates TLS when the server offers it, but checks the
-        # server certificate only when a CA file is given.
+        # server certificate only when a CA file is given. A verified
+        # certificate is required unless TARGET_MYSQL_SSL_VERIFY=no.
         tls = {}
-        if cfg.mysql_ssl_ca:
+        if cfg.mysql_ssl_verify:
+            if not cfg.mysql_ssl_ca:
+                raise RuntimeError(
+                    "TARGET_MYSQL_SSL_CA is not set: set it to the CA certificate that "
+                    "issued the MySQL server certificate, or set TARGET_MYSQL_SSL_VERIFY=no "
+                    "to connect without verifying the server")
             tls = {"ssl_ca": cfg.mysql_ssl_ca, "ssl_verify_cert": True,
                    "ssl_verify_identity": cfg.mysql_ssl_verify_identity}
+        else:
+            log.warning("TARGET_MYSQL_SSL_VERIFY=no: the MySQL server certificate is not "
+                        "verified")
         self.conn = pymysql.connect(
             host=cfg.host,
             port=cfg.port,

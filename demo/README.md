@@ -105,6 +105,13 @@ export SRC=SIMPLE_REVERSE_ETL_DEMO.DENTAL.DENTAL_CLAIMS
 
 All commands in Parts 1 to 5 are identical for both targets.
 
+For MySQL, the job requires a verified server certificate. `target_env.sh` copies the CA
+certificate that the MySQL container generated to `demo/.mysql-demo-ca.pem` and sets
+`TARGET_MYSQL_SSL_CA` to it. Host-name checking is turned off for the demo only, because
+that certificate is not issued for `127.0.0.1`. If the MySQL container was not yet running
+when you sourced the script, run `./demo/reset_demo.sh` (which starts it and copies the
+certificate) and source the script again.
+
 **Check:** the script ends with `Reset complete`. In TablePlus, all three tables are empty.
 
 ### Running against SQL Server
@@ -229,8 +236,11 @@ python sync.py --transport unload --source $SRC --target DENTAL_CLAIMS_STAGED \
     --change-capture hwm --hwm-col UPDATED_AT \
     --mode upsert --key-cols CLAIM_ID \
     --stage @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE \
-    --state-file sync_state_unload.json --local-dir _unload_tmp
+    --state-file sync_state_unload.json --local-dir _unload_tmp --keep-files
 ```
+
+`--keep-files` keeps the unloaded files on the stage and in `_unload_tmp` so they can be
+shown next. Without it, a successful run deletes them.
 
 **Expected output:**
 
@@ -294,7 +304,7 @@ python sync.py --transport unload --source $SRC --target DENTAL_CLAIMS_STAGED \
     --change-capture hwm --hwm-col UPDATED_AT \
     --mode upsert --key-cols CLAIM_ID \
     --stage @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE \
-    --state-file sync_state_unload.json --local-dir _unload_tmp
+    --state-file sync_state_unload.json --local-dir _unload_tmp --keep-files
 ```
 
 **Expected output:**
@@ -404,7 +414,7 @@ deltas and work with either transport.
 ```bash
 python sync.py --transport unload --source $SRC --target DENTAL_CLAIMS_CDC \
     --change-capture none --mode truncate \
-    --stage @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE --local-dir _unload_tmp
+    --stage @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE --local-dir _unload_tmp --keep-files
 ```
 
 **Expected output:** `Unloaded 22 rows to .../dental_claims_cdc/upsert/`,
@@ -472,7 +482,7 @@ python sync.py --transport unload --source $SRC --target DENTAL_CLAIMS_CDC \
     --outbox SIMPLE_REVERSE_ETL_DEMO.DENTAL.CLAIMS_OUTBOX \
     --outbox-retention-days 1 \
     --mode upsert --key-cols CLAIM_ID \
-    --stage @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE --local-dir _unload_tmp
+    --stage @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE --local-dir _unload_tmp --keep-files
 ```
 
 **Expected output:**
@@ -512,7 +522,7 @@ Optionally, run the stream command once more. It reports `Consumed 0 change rows
 |---|---|---|
 | Best for | Incremental deltas and moderate volumes | Large full or incremental loads |
 | Load method | Batched upsert statements | Native bulk loader |
-| After a failure | Rerun; the window is queried again | Rerun; the window is unloaded again (the last run's files stay in `_unload_tmp` for inspection) |
+| After a failure | Rerun; the window is queried again | Rerun; the window is unloaded again (a failed run's files stay in `_unload_tmp` for inspection) |
 | Change capture | `none`, `hwm`, `stream` | `none`, `hwm`, `stream` |
 | Target load | MySQL `INSERT ... ON DUPLICATE KEY UPDATE`; SQL Server `MERGE` | MySQL `LOAD DATA LOCAL INFILE`; SQL Server `BULK INSERT` |
 | Job host connects to | Snowflake (and stage storage) | Snowflake and stage storage, or only the bucket if Snowflake schedules the unload (described in the main README, not implemented) |

@@ -28,9 +28,11 @@ def test_valid_defaults():
 @pytest.mark.parametrize("argv, message", [
     (["--mode", "upsert"], "requires --key-cols"),
     (["--change-capture", "hwm", "--mode", "upsert", "--key-cols", "ID"], "requires --hwm-col"),
-    (["--change-capture", "hwm", "--hwm-col", "U"], "upsert or --mode append"),
+    (["--change-capture", "hwm", "--hwm-col", "U"], "requires --mode upsert"),
+    (["--change-capture", "hwm", "--hwm-col", "U", "--mode", "append"], "requires --mode upsert"),
     (["--change-capture", "stream", "--mode", "upsert", "--key-cols", "ID"], "--stream and --outbox"),
     (["--stage", "@S"], "only to --transport unload"),
+    (["--keep-files"], "only to --transport unload"),
     (["--transport", "unload", "--commit-rows", "5"], "only to --transport pull"),
     (["--outbox-retention-days", "-1"], "0 or more"),
 ])

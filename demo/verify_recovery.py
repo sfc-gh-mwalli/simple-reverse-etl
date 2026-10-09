@@ -14,8 +14,8 @@ failure, the check:
   5. compares the target with the source.
 
 Pass means: the failed run exits non-zero, both later runs exit 0, and the
-target matches the source. For --mode append, "matches" means every source row
-version is present; rows delivered more than once are reported, not failed.
+target matches the source. (--change-capture hwm --mode append is rejected by
+the job, because a retry of such a run inserted rows twice.)
 
   DEMO_TARGET=mysql ./demo/verify_recovery.sh
   DEMO_TARGET=mssql ./demo/verify_recovery.sh
@@ -49,7 +49,7 @@ TABLE = "RECOVERY_T"
 
 # (change capture, mode). hwm cannot see deletes or key changes, so its
 # scenarios change the source only with inserts and updates.
-SCENARIOS = [("none", "truncate"), ("hwm", "upsert"), ("hwm", "append"), ("stream", "upsert")]
+SCENARIOS = [("none", "truncate"), ("hwm", "upsert"), ("stream", "upsert")]
 TRANSPORTS = ("pull", "unload")
 FAILURES = ("read", "mid_write", "commit", "state", "kill")
 
@@ -178,10 +178,10 @@ def run_killed(argv, transport, kind) -> int:
 
 # --- target side ----------------------------------------------------------------
 
-def recreate_target(target, kind, mode) -> None:
+def recreate_target(target, kind) -> None:
     cur = target.conn.cursor()
     cur.execute(f"DROP TABLE IF EXISTS {TABLE}")
-    cur.execute(TARGET_DDL[kind].format(t=TABLE, pk="" if mode == "append" else " PRIMARY KEY"))
+    cur.execute(TARGET_DDL[kind].format(t=TABLE, pk=" PRIMARY KEY"))
     target.commit()
 
 
@@ -195,24 +195,10 @@ def target_rows(tcfg) -> list[tuple]:
         t.close()
 
 
-def compare(mode, expected, actual) -> tuple[bool, str]:
-    if mode != "append":
-        if actual == expected:
-            return True, ""
-        return False, f"expected {expected} got {actual}"
-    missing = sorted(set(expected) - set(actual))
-    extra = sorted(set(actual) - set(expected))
-    dupes = len(actual) - len(set(actual))
-    note = f"{dupes} row(s) delivered twice" if dupes else ""
-    if missing or extra:
-        return False, f"missing {missing} unexpected {extra}"
-    return True, note
-
-
-def append_expected(baseline, after_change) -> list[tuple]:
-    """Every row version an append target should hold: the baseline plus the
-    versions added or changed since."""
-    return sorted(set(baseline) | set(after_change))
+def compare(expected, actual) -> tuple[bool, str]:
+    if actual == expected:
+        return True, ""
+    return False, f"expected {expected} got {actual}"
 
 
 # --- driver ---------------------------------------------------------------------
@@ -232,7 +218,6 @@ def main() -> int:
     cur = conn.cursor()
     admin = targets.make_target(tcfg)
     failures = passes = 0
-    notes = []
     try:
         for cc, mode in SCENARIOS:
             for transport in TRANSPORTS:
@@ -246,20 +231,17 @@ def main() -> int:
                         state = os.path.join(tmp, "state.json")
                         argv = job_argv(cc, mode, transport, state)
                         reset_source(cur)
-                        recreate_target(admin, tcfg.kind, mode)
+                        recreate_target(admin, tcfg.kind)
                         # Baseline: stream mode starts from a full load.
                         base_argv = (job_argv("none", "truncate", transport, state)
                                      if cc == "stream" else argv)
                         rc_base = run_job(base_argv, transport)
-                        baseline = source_rows(cur)
                         change_source(cur, cc)
                         rc_fail = (run_killed(argv, transport, tcfg.kind) if failure == "kill"
                                    else run_job(argv, transport, failure, target_cls))
                         rc_retry = run_job(argv, transport)
                         rc_again = run_job(argv, transport)
-                        current = source_rows(cur)
-                        expected = append_expected(baseline, current) if mode == "append" else current
-                        ok, detail = compare(mode, expected, target_rows(tcfg))
+                        ok, detail = compare(source_rows(cur), target_rows(tcfg))
                         codes_ok = rc_base == 0 and rc_fail != 0 and rc_retry == 0 and rc_again == 0
                         if not codes_ok:
                             ok = False
@@ -267,8 +249,6 @@ def main() -> int:
                                       f"retry={rc_retry} again={rc_again} {detail}")
                         passes += ok
                         failures += not ok
-                        if ok and detail:
-                            notes.append(f"{name}: {detail}")
                         print(f"{'PASS' if ok else 'FAIL'}  {name:34} {detail}", flush=True)
     finally:
         if not opts.keep:
@@ -282,8 +262,6 @@ def main() -> int:
         conn.close()
 
     print(f"RESULT: {passes} passed, {failures} failed")
-    for n in notes:
-        print("NOTE  ", n)
     return 0 if failures == 0 else 1
 
 

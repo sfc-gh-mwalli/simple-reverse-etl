@@ -109,9 +109,11 @@ def unload_apply(sf_conn, target, plan, args) -> tuple[int, int]:
 
     Layout: <stage>/<target>/upsert/ holds the rows to write and, in stream
     mode, <stage>/<target>/delete/ holds the keys to delete. They are retrieved
-    into --local-dir/upsert/ and --local-dir/delete/. Stage files are kept until
-    the next run for the same target; --local-dir is emptied at the start of
-    every run, so use a separate --local-dir per concurrently scheduled target.
+    into --local-dir/upsert/ and --local-dir/delete/. After a successful run the
+    caller deletes both (cleanup_unload) unless --keep-files is given; after a
+    failed run they are kept for inspection until the next run for the target.
+    --local-dir is emptied at the start of every run, so use a separate
+    --local-dir per concurrently scheduled target.
     """
     stage_path = f"{args.stage.rstrip('/')}/{args.target.lower()}/"
     local_dir = os.path.abspath(args.local_dir)
@@ -142,6 +144,19 @@ def unload_apply(sf_conn, target, plan, args) -> tuple[int, int]:
     log.info("Bulk-loaded %s file(s) (%s rows) -> %s",
              len(rows) + len(keys), n_rows + n_keys, args.target)
     return n_rows, n_keys
+
+
+def cleanup_unload(sf_conn, args) -> None:
+    """After a successful run: delete this target's stage files and empty
+    --local-dir, so no plain-text copy of the data stays on the job host. A
+    cleanup failure is logged but does not fail the committed run; the next run
+    clears both anyway."""
+    try:
+        sf_conn.cursor().execute(f"REMOVE {args.stage.rstrip('/')}/{args.target.lower()}/")
+        _clear_dir(os.path.abspath(args.local_dir))
+    except Exception:  # noqa: BLE001
+        log.warning("Could not delete the unloaded files after a successful run",
+                    exc_info=True)
 
 
 TRANSPORTS = {"pull": pull_apply, "unload": unload_apply}

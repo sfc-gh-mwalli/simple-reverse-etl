@@ -19,7 +19,7 @@ Write modes (--mode):
   append    plain inserts
 
 Every run is one target transaction (the pull transport may commit every
---commit-rows rows for none/hwm). hwm needs --mode upsert or append. Watermark or outbox state advances only after
+--commit-rows rows for none/hwm). hwm needs --mode upsert. Watermark or outbox state advances only after
 the target commit, so a failed run is retried from the same point.
 
 Examples
@@ -57,7 +57,7 @@ import snowflake_source as sf
 from change_capture import PLANNERS
 from config import SnowflakeConfig, TargetConfig
 from targets import make_target
-from transports import TRANSPORTS
+from transports import TRANSPORTS, cleanup_unload
 
 log = logging.getLogger("sync")
 
@@ -126,6 +126,10 @@ def parse_args(argv=None):
     g.add_argument("--local-dir", default=None,
                    help=f"Local folder for downloaded files (default {DEFAULT_LOCAL_DIR}); "
                         "for SQL Server BULK INSERT, a folder SQL Server can also read")
+    g.add_argument("--keep-files", action="store_true",
+                   help="Keep the unloaded files on the stage and in --local-dir after a "
+                        "successful run (default: delete them; they are always kept "
+                        "after a failed run)")
     return p.parse_args(argv)
 
 
@@ -147,9 +151,10 @@ def validate(args) -> str | None:
     if args.change_capture == "hwm":
         if not args.hwm_col:
             return "--change-capture hwm requires --hwm-col"
-        if args.mode == "truncate":
-            # Truncating and then loading only the delta would lose every other row.
-            return "--change-capture hwm requires --mode upsert or --mode append"
+        if args.mode != "upsert":
+            # truncate would keep only the delta; append inserts rows twice when a
+            # failed run's window is sent again (tested in demo/verify_recovery.py).
+            return "--change-capture hwm requires --mode upsert and --key-cols"
     if args.change_capture == "stream":
         if not (args.stream and args.outbox):
             return "--change-capture stream requires --stream and --outbox"
@@ -158,8 +163,8 @@ def validate(args) -> str | None:
     if args.outbox_retention_days < 0:
         return "--outbox-retention-days must be 0 or more"
     if args.transport == "pull":
-        if args.stage is not None or args.local_dir is not None:
-            return "--stage and --local-dir apply only to --transport unload"
+        if args.stage is not None or args.local_dir is not None or args.keep_files:
+            return "--stage, --local-dir and --keep-files apply only to --transport unload"
         args.commit_rows = args.commit_rows or DEFAULT_COMMIT_ROWS
     else:
         if args.commit_rows is not None:
@@ -192,7 +197,12 @@ def main(argv=None) -> int:
 
     # The target connection is opened first so that its lock is held before
     # anything in Snowflake (stream consume, unload) is touched.
-    target = make_target(TargetConfig.from_env())
+    try:
+        target = make_target(TargetConfig.from_env())
+    except Exception:
+        log.exception("Could not connect to the target; nothing was done")
+        _summary(args, "failed", started)
+        return EXIT_FAILED
     if not target.acquire_lock(args.target):
         log.error("Another run for target %s holds the lock; nothing was done", args.target)
         target.close()
@@ -221,15 +231,20 @@ def main(argv=None) -> int:
         return EXIT_FAILED
     try:
         plan.on_commit()
-        log.info(plan.summary(written, deleted))
-        _summary(args, "ok", started, written, deleted)
-        return EXIT_OK
     except Exception:
         # The target is committed; only the state update failed. The next run
-        # re-sends the same rows: harmless for upserts, duplicates for append.
+        # re-sends the same rows, which upserts make harmless.
         log.exception("Target committed, but saving watermark/outbox state failed")
         _summary(args, "state_not_saved", started, written, deleted)
+        target.close()
+        sf_conn.close()
         return EXIT_STATE
+    try:
+        log.info(plan.summary(written, deleted))
+        if args.transport == "unload" and not args.keep_files:
+            cleanup_unload(sf_conn, args)
+        _summary(args, "ok", started, written, deleted)
+        return EXIT_OK
     finally:
         target.close()
         sf_conn.close()

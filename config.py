@@ -93,6 +93,7 @@ class TargetConfig:
     statement_timeout: int | None = None    # seconds a target statement may wait
     # --- MySQL only ----------------------------------------------------------
     mysql_ssl_ca: str | None = None         # CA file: verify the server certificate
+    mysql_ssl_verify: bool = True           # require a verified certificate
     mysql_ssl_verify_identity: bool = True  # with a CA: also check the host name
     # --- SQL Server only -----------------------------------------------------
     odbc_driver: str | None = None
@@ -120,6 +121,7 @@ class TargetConfig:
             password=_get("TARGET_PASSWORD", required=True),
             statement_timeout=_get_int("TARGET_STATEMENT_TIMEOUT_SECONDS"),
             mysql_ssl_ca=_get("TARGET_MYSQL_SSL_CA") or None,
+            mysql_ssl_verify=_get_bool("TARGET_MYSQL_SSL_VERIFY", True),
             mysql_ssl_verify_identity=_get_bool("TARGET_MYSQL_SSL_VERIFY_IDENTITY", True),
             odbc_driver=_get("TARGET_ODBC_DRIVER", "ODBC Driver 18 for SQL Server"),
             mssql_encrypt=_get_bool("TARGET_MSSQL_ENCRYPT", True),

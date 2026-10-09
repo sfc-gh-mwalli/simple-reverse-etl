@@ -78,10 +78,11 @@ set. Each run first empties the stage path for the target and then unloads with
 `INCLUDE_QUERY_ID = TRUE`, which the documentation recommends over `OVERWRITE = TRUE`
 because after an internal retry "Snowflake deletes the partial set of unloaded files"
 ([COPY INTO \<location\>](https://docs.snowflake.com/en/sql-reference/sql/copy-into-location)).
-The files of the last run stay in `--local-dir` until the next run and on the stage
-until the next run for the same target, so a failed load can be inspected; a rerun
-unloads again. Each run empties `--local-dir` first, so give each target its own folder
-if runs for different targets can overlap.
+After a successful run the job deletes this target's files from the stage and from
+`--local-dir`, so no copy of the data stays behind (`--keep-files` keeps them). After a
+failed run they are kept, so a failed load can be inspected; a rerun unloads again. Each
+run empties `--local-dir` first, so give each target its own folder if runs for
+different targets can overlap.
 
 The code follows the same split: [change_capture.py](change_capture.py) builds a plan of
 what to send, [transports.py](transports.py) moves it, [targets.py](targets.py) writes to
@@ -108,7 +109,7 @@ the rerun completes the load (tested).
 
 **What was tested.** [demo/verify_recovery.py](demo/verify_recovery.py) runs every
 combination of change capture and write mode (`none`/`truncate`, `hwm`/`upsert`,
-`hwm`/`append`, `stream`/`upsert`) with both transports, and injects each of these
+`stream`/`upsert`) with both transports, and injects each of these
 failures in turn:
 
 - the Snowflake read or unload fails
@@ -120,19 +121,20 @@ failures in turn:
 Before the failure the source receives inserts, an update, and, where the mode can see
 them, a delete and an `UPDATE` that changes the key value. After each failure the job is
 run twice more without a failure, and the target is compared with Snowflake. On MySQL 8.4,
-SQL Server 2022 with `bulk_insert`, and SQL Server 2022 with `client`, all 38 applicable
+SQL Server 2022 with `bulk_insert`, and SQL Server 2022 with `client`, all 28 applicable
 scenarios ended with the target matching the source, the failed run exiting non-zero, and
-both later runs exiting 0. The only difference from the source was the documented one: with
-`hwm` and `--mode append`, two or three rows were delivered twice after a Transport A
-partial commit or a progress-save failure.
+both later runs exiting 0. An earlier version of the job also accepted `hwm` with
+`--mode append`; in the same tests two or three rows were delivered twice after a
+Transport A partial commit or a progress-save failure, so that combination is now
+rejected.
 
 **Runbook.**
 
 - *A run failed (exit 1).* Read the logged error, fix the cause, and rerun. No cleanup is
-  needed. A Transport B run starts by emptying `--local-dir` and the stage path for the
-  target.
-- *Progress was not saved (exit 4).* Rerun. With upserts the result is unchanged; with
-  `--mode append` remove the duplicates or reload.
+  needed. For Transport B the failed run's files are on the stage and in `--local-dir`;
+  the next run deletes them before it unloads.
+- *Progress was not saved (exit 4).* Rerun. The rows are sent again and upserted, so the
+  result is unchanged.
 - *The run reported the lock (exit 3) unexpectedly.* Another run is active for the same
   target, possibly still in progress from an earlier schedule. The lock belongs to that
   run's database session and is released when it ends, including when the process is
@@ -197,16 +199,20 @@ partial commit or a progress-save failure.
   target. Grant the job's role access deliberately.
 - **Data at rest.** Files on an internal stage are "client-side encrypted by
   default"; files downloaded by `GET` are written with permissions `600` by default. The
-  decompressed CSV files in `--local-dir` are plain text and stay until the next run for
-  that target. Put `--local-dir` on an encrypted volume readable only by the job (and, for
+  decompressed CSV files in `--local-dir` are plain text. They are deleted after a
+  successful run (tested), but remain after a failed run or with `--keep-files`. Put
+  `--local-dir` on an encrypted volume readable only by the job (and, for
   `bulk_insert`, by the SQL Server service account).
 - **Connections to the target.** SQL Server connections are encrypted and the certificate
-  is verified by default (`TARGET_MSSQL_ENCRYPT`, `TARGET_MSSQL_TRUST_SERVER_CERT`). For
-  MySQL, PyMySQL negotiated TLS with the test server without any setting
-  (`Ssl_cipher` `TLS_AES_256_GCM_SHA384`) but did not verify the certificate. Set
-  `TARGET_MYSQL_SSL_CA` to verify it; tested: the server's CA was accepted and an unrelated
-  CA was rejected. Host-name checking (`TARGET_MYSQL_SSL_VERIFY_IDENTITY`, default `yes`)
-  requires a certificate issued for the host name used in `TARGET_HOST`.
+  is verified by default (`TARGET_MSSQL_ENCRYPT`, `TARGET_MSSQL_TRUST_SERVER_CERT`).
+  MySQL connections require a verified server certificate: set `TARGET_MYSQL_SSL_CA` to
+  the CA that issued it, or the job refuses to connect. Tested: without a CA the job
+  refused to connect, the server's CA was accepted, and an unrelated CA was rejected.
+  Host-name checking (`TARGET_MYSQL_SSL_VERIFY_IDENTITY`, default `yes`) requires a
+  certificate issued for the host name used in `TARGET_HOST`.
+  `TARGET_MYSQL_SSL_VERIFY=no` turns verification off and logs a warning. PyMySQL then
+  still negotiated TLS with the test server (`Ssl_cipher` `TLS_AES_256_GCM_SHA384`), but
+  without checking whom it was talking to.
 - **Input handling.** Table, column, stream, outbox, and stage names given on the command
   line are checked against a plain-identifier pattern before they are used in SQL; values
   are always bound as parameters.
@@ -316,8 +322,9 @@ much faster on MySQL but not necessarily on SQL Server (see
 
 - `none` — the full source on every run. Typically combined with `--mode truncate`.
 - `hwm` — rows whose monotonic high-water-mark column (for example `UPDATED_AT`) is greater
-  than the last delivered value (the watermark). Requires `--mode upsert` (or `append`);
-  `truncate` is rejected because it would empty the target before loading only the delta.
+  than the last delivered value (the watermark). Requires `--mode upsert`;
+  `truncate` is rejected because it would empty the target before loading only the delta,
+  and `append` because a retried window would insert rows twice.
   Each run reads `MAX(col)` as a ceiling
   before extraction, loads the rows between the watermark and the ceiling, and records the
   ceiling as the new watermark only after the target commit succeeds, so a failed run is
@@ -329,7 +336,7 @@ much faster on MySQL but not necessarily on SQL Server (see
   [change_capture.py](change_capture.py) with a control
   table or scheduler variable.
 
-  Three properties of the watermark, each confirmed by test
+  Two properties of the watermark, each confirmed by test
   ([demo/verify_edge_cases.py](demo/verify_edge_cases.py) and
   [demo/verify_recovery.py](demo/verify_recovery.py)):
 
@@ -343,11 +350,6 @@ much faster on MySQL but not necessarily on SQL Server (see
     ([CURRENT_TIMESTAMP](https://docs.snowflake.com/en/sql-reference/functions/current_timestamp)).
     Use `hwm` only where the column is set by a single writer that commits promptly, or
     use `stream`.
-  - *With `--mode append`, a retry can insert rows twice.* After a Transport A run that
-    committed some batches and then failed, or after any run whose target commit
-    succeeded but whose watermark could not be saved (exit code 4), the next run re-sends
-    the window. Upserts absorb this; appends do not. Prefer `--mode upsert`; use `append`
-    only for targets that tolerate or remove duplicates.
 - `stream` — Both transports. Uses a Snowflake stream instead of a watermark column, and
   also propagates deletes. See [Stream-based change capture](#stream-based-change-capture).
 
@@ -471,8 +473,7 @@ outbox.
 
 `--mode truncate` replaces the target contents; `--mode upsert` merges on
 `--key-cols`, which must correspond to a primary or unique key on the target;
-`--mode append` inserts only. `hwm` requires `upsert` or `append`; stream mode requires
-`upsert`.
+`--mode append` inserts only (with `none`). `hwm` and stream mode require `upsert`.
 
 **NULL handling (Transport B).** SQL `NULL` values are unloaded as an explicit sentinel and
 converted back to `NULL` during the bulk load, so `NULL` and empty strings remain distinct
@@ -554,7 +555,8 @@ or secret store.
 | `TARGET_MSSQL_TRUST_SERVER_CERT` | SQL Server: skip server certificate validation (default `no`). Set `yes` only for test servers with self-signed certificates. |
 | `TARGET_MSSQL_LOAD_METHOD` | SQL Server, Transport B: `bulk_insert` (default) or `client`. See [SQL Server targets](#sql-server-targets). |
 | `TARGET_MSSQL_BULK_DIR` | SQL Server, `bulk_insert` only: the `--local-dir` folder as SQL Server sees it, for example `\\fileserver\share\unload`. |
-| `TARGET_MYSQL_SSL_CA` | MySQL: CA certificate file. When set, the server certificate is verified. See [Security](#security). |
+| `TARGET_MYSQL_SSL_CA` | MySQL: CA certificate file used to verify the server certificate. Required unless `TARGET_MYSQL_SSL_VERIFY=no`. See [Security](#security). |
+| `TARGET_MYSQL_SSL_VERIFY` | MySQL: `no` connects without verifying the server certificate (default `yes`). |
 | `TARGET_MYSQL_SSL_VERIFY_IDENTITY` | MySQL, with a CA: also check the server host name (default `yes`). |
 | `SF_STATEMENT_TIMEOUT_SECONDS` | Optional Snowflake statement timeout for the job's session. |
 | `TARGET_STATEMENT_TIMEOUT_SECONDS` | Optional timeout for each target statement. |
@@ -786,7 +788,7 @@ other database versions, and network-share `BULK INSERT` were not tested.
 | [demo/verify_fidelity.sh](demo/verify_fidelity.sh) | `NULL`, empty strings, non-ASCII text, quotes, newlines, booleans |
 | [demo/verify_recovery.sh](demo/verify_recovery.sh) | Injected failures and restarts for every mode and transport |
 | [demo/verify_edge_cases.sh](demo/verify_edge_cases.sh) | Data types, key requirements, `NULL` watermarks, late commits, views |
-| [demo/verify_operations.sh](demo/verify_operations.sh) | Run lock, query tag, timeouts, exit codes, MySQL certificate verification |
+| [demo/verify_operations.sh](demo/verify_operations.sh) | Run lock, query tag, timeouts, exit codes, file cleanup, MySQL certificate verification |
 | `python -m pytest tests` | Option validation and query construction (no database; also run in CI) |
 
 ## Known limitations
