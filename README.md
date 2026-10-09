@@ -169,8 +169,8 @@ the connectivity profile:
 Transport A is the simpler option and is well suited to scheduled delta synchronization.
 Transport B is preferable when full reloads or large deltas make row-level DML the
 bottleneck, and is the natural fit when an object-storage hand-off is the approved
-integration pattern. Whether it is faster depends on the target: in our volume test it
-was about twice as fast as Transport A on MySQL but no faster on SQL Server (see
+integration pattern. Whether it is faster depends on the target: it is typically
+much faster on MySQL but not necessarily on SQL Server (see
 [Performance](#performance)), so measure both against your target.
 
 ## Change capture and write semantics
@@ -448,14 +448,14 @@ targets whose columns are defined in lower case and compared case-sensitively.
 
 ## Performance
 
-These measurements come from the volume test in the demo
+The figures below come from the demo's volume test
 ([Part 7](demo/README.md#part-7-volume-test-optional-not-for-the-live-session)): a
 21-column claims table of 10,000,000 rows, then 5,000,000 inserts plus 1,000,000 updates,
-loaded with `--change-capture hwm --mode upsert` and checked value by value against
-Snowflake. They were taken on a laptop (Apple silicon, Docker with 8 CPUs and 8 GB,
-MySQL 8.4 with a 2 GB buffer pool, SQL Server 2022 running under x86 emulation) against a
-small Snowflake warehouse over the internet. Treat them as relative, not as sizing
-figures; repeat the test on representative hardware before sizing a deployment.
+loaded with `--change-capture hwm --mode upsert`. They were taken on a laptop (Apple
+silicon, Docker with 8 CPUs and 8 GB, MySQL 8.4 with a 2 GB buffer pool, SQL Server 2022
+under x86 emulation) against a small Snowflake warehouse over the internet. Use them to
+compare options, not to size a deployment; repeat the test on representative hardware
+for that. Results on the emulated SQL Server varied by up to about 30% between runs.
 
 | Target | Initial load, 10M rows: A | Initial load: B | Incremental, 5M inserts + 1M updates: A | Incremental: B |
 |---|---|---|---|---|
@@ -463,58 +463,42 @@ figures; repeat the test on representative hardware before sizing a deployment.
 | SQL Server 2022, `bulk_insert` | 505 s (20k/s) | 518 s (19k/s) | 298 s (20k/s) | 355 s (17k/s) |
 | SQL Server 2022, `client` | 489 s (20k/s) | 764 s (13k/s) | 296 s (20k/s) | 507 s (12k/s) |
 
-All runs matched Snowflake on every check. Run-to-run variation on the emulated SQL Server
-container was large: Transport A's initial load took 387 s in one run and 505 s in
-another with the same code.
+**Best practices:**
 
-Two changes made during this testing account for much of these numbers. Before them:
-
-| Change | Run | Before | After |
-|---|---|---|---|
-| Rows delivered in key order | MySQL, initial load, A / B | 761 s / 667 s | 260 s / 127 s |
-| | MySQL, incremental, A / B | 306 s / 239 s | 165 s / 99 s |
-| SQL Server Transport B merges from a typed, indexed temporary table | `bulk_insert`, initial / incremental | 673 s / 537 s | 518 s / 355 s |
-| | `client`, initial / incremental | 932 s / 675 s | 764 s / 507 s |
-
-**What we learned:**
-
-- **The target database is the bottleneck, not Snowflake.** Generating the 10,000,000
-  rows took about 20 seconds and unloading them about 13. Nearly all of each run is spent
-  writing to the target, so tune the target before anything else.
-- **Deliver rows in key order.** When `--key-cols` is given, the job orders the extract
-  by the key, so the target appends to its primary-key index instead of inserting at
-  random positions. Once the table outgrows the database's memory this matters a lot:
-  on MySQL it made the initial load 3 to 5 times faster and the incremental load about
-  2 times faster.
-- **Size the target's memory for the table.** With MySQL's defaults (128 MB buffer pool,
-  100 MB redo log) a multi-gigabyte table load becomes disk-bound and the job and the
-  server both sit mostly idle. A production server is normally sized for its data; the
-  demo container uses a 2 GB buffer pool and redo log.
-- **Which transport is faster depends on the target.** On MySQL, Transport B
-  (`LOAD DATA`) was about twice as fast as Transport A. On SQL Server, Transport B with
-  `bulk_insert` matched Transport A on the initial load and was slower on the
-  incremental load: it stages each file as text, converts it to the target's types, and
-  merges it, all in one transaction for the whole run, while Transport A merges typed
-  batches and commits as it goes. A native SQL Server installation on Windows with fast
-  storage may behave differently; measure both.
-- **For SQL Server Transport B upserts, merge from a typed, key-ordered temporary
-  table.** Merging straight from the text staging table took about 57 seconds per
-  file of 590,000 rows; converting first into a temporary table with the target's column
-  types and a clustered index on the key brought that to about 20 seconds, and cut
-  Transport B run times by 23 to 34%. The job does this.
-- **`bulk_insert` beats `client` on SQL Server** (about 30% faster here) when a shared
-  folder is available, because SQL Server reads the files itself instead of receiving
-  them over ODBC.
-- **Updates cost more than inserts.** In the incremental runs, the 1,000,000 updates
-  touch existing rows spread across the table. On MySQL, Transport B applies them with
-  `LOAD DATA ... REPLACE`, which deletes and re-inserts each row.
-- **Transaction and log size.** Transport A commits every `--commit-rows` rows (default
+- **Tune the target first.** Snowflake is rarely the bottleneck: generating the
+  10,000,000 rows took about 20 seconds and unloading them about 13. Nearly all of each
+  run is spent writing to the target database.
+- **Size the target's memory for the table.** When a table no longer fits in the
+  database's cache (with MySQL's defaults, a 128 MB buffer pool and 100 MB redo log), a
+  large load becomes disk-bound and both the job and the server sit mostly idle. Size
+  the buffer pool and redo log (MySQL) or memory and log (SQL Server) for the data.
+- **Deliver rows in primary-key order.** The job orders each extract by `--key-cols`, so
+  the target appends to its primary-key index instead of inserting at random positions.
+  On a table larger than the cache this is several times faster than an unordered
+  extract. Keep this ordering if you replace the queries, and give target tables a
+  primary key that matches `--key-cols`.
+- **Measure both transports against your target.** Transport B was about twice as fast as
+  Transport A on MySQL, where `LOAD DATA` is very efficient. On SQL Server it was no
+  faster: each file is staged as text, converted to the target's types, and merged, in
+  one transaction for the whole run, while Transport A merges typed batches and commits
+  as it goes. A native SQL Server on fast storage may behave differently.
+- **On SQL Server, prefer `bulk_insert` to `client`** when a folder shared with the
+  server is available; SQL Server reads the files itself rather than receiving them over
+  ODBC. It was about 30% faster here.
+- **Merge from typed, key-indexed data.** For SQL Server upserts, the job converts each
+  file into a temporary table with the target's column types and a clustered index on
+  the key before the `MERGE`; merging directly from text columns is several times slower.
+  The same applies to any custom staging you add.
+- **Expect updates to cost more than inserts.** Updates touch existing rows spread across
+  the table. On MySQL, Transport B applies them with `LOAD DATA ... REPLACE`, which
+  deletes and re-inserts each row.
+- **Plan for transaction size.** Transport A commits every `--commit-rows` rows (default
   100,000). Transport B and stream mode apply a run in one transaction, so a large run
-  needs room in the target's transaction log (SQL Server) or redo/undo space (MySQL), and
-  a failure rolls back the whole run.
-- **Disk for Transport B.** The 10,000,000-row unload was about 2.4 GB compressed and
-  5 GB uncompressed in `--local-dir`; SQL Server `bulk_insert` adds a UTF-16 copy of each
-  file while it is loaded.
+  needs room in the target's transaction log (SQL Server) or redo and undo space (MySQL),
+  and a failure rolls back the whole run.
+- **Provision disk for Transport B.** A 10,000,000-row unload of this table was about
+  2.4 GB compressed and 5 GB uncompressed in `--local-dir`; SQL Server `bulk_insert` adds
+  a UTF-16 copy of each file while it loads.
 
 ## Production considerations
 
@@ -537,8 +521,8 @@ Two changes made during this testing account for much of these numbers. Before t
 - **Volume.** Prefer incremental change capture over full reloads, size the target for
   the table, and measure both transports against your target; see
   [Performance](#performance). Transport A read throughput can be increased further with
-  `cursor.get_result_batches()` for parallel retrieval, although in our tests the target,
-  not the read, was the bottleneck.
+  `cursor.get_result_batches()` for parallel retrieval, although the target, not the read,
+  is usually the bottleneck.
 - **Stream retention.** In stream mode, schedule runs well inside the stream's
   `STALE_AFTER` window; see [Stream-based change capture](#stream-based-change-capture).
 
