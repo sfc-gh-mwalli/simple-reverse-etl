@@ -11,7 +11,11 @@ For architecture, network requirements, and production guidance, see the
 [top-level README](../README.md). For an unattended run of the whole sequence, use
 `./demo/run_demo.sh`. To check that awkward values (NULL, empty strings, non-ASCII text,
 quotes, newlines, booleans) survive both transports unchanged, run
-`./demo/verify_fidelity.sh`. To measure throughput at volume, see
+`./demo/verify_fidelity.sh`. Three further suites test failure recovery
+(`./demo/verify_recovery.sh`), data types and edge cases (`./demo/verify_edge_cases.sh`),
+and the run lock, timeouts, and TLS (`./demo/verify_operations.sh`); see
+[Tested versions](../README.md#tested-versions). They create and drop their own tables. To
+measure throughput at volume, see
 [Part 7](#part-7-volume-test-optional-not-for-the-live-session). All accept
 `DEMO_TARGET=mssql`.
 
@@ -150,13 +154,13 @@ three are empty.
 |---|---|
 | [config.py](../config.py) | All settings come from environment variables. Credentials are never in code. |
 | [snowflake_source.py](../snowflake_source.py#L42) `connect()` | Uses a named connection, key-pair, or PAT. The connection is outbound HTTPS to Snowflake. |
-| [snowflake_source.py](../snowflake_source.py#L110) `build_hwm_query()` | Selects rows between the last watermark and a ceiling captured before the read, so rows updated during the read are not skipped. |
-| [snowflake_source.py](../snowflake_source.py#L76) `read_query_batches()` | Streams the result as Apache Arrow batches with `fetch_pandas_batches()`. Memory use depends on batch size, not result size. |
+| [snowflake_source.py](../snowflake_source.py#L145) `build_hwm_query()` | Selects rows between the last watermark and a ceiling captured before the read, so rows updated during the read are not skipped. |
+| [snowflake_source.py](../snowflake_source.py#L111) `read_query_batches()` | Streams the result as Apache Arrow batches with `fetch_pandas_batches()`. Memory use depends on batch size, not result size. |
 | [transports.py](../transports.py#L45) `pull_apply()` | Transport A: writes each Arrow batch to the target. |
-| [targets.py](../targets.py#L65) `MySQLTarget.write()` | MySQL: batched `INSERT ... ON DUPLICATE KEY UPDATE`, an upsert on the primary key. |
-| [targets.py](../targets.py#L330) `MSSQLTarget.write()` | SQL Server: batched inserts into a session temporary table, then one `MERGE`. |
+| [targets.py](../targets.py#L83) `MySQLTarget.write()` | MySQL: batched `INSERT ... ON DUPLICATE KEY UPDATE`, an upsert on the primary key. |
+| [targets.py](../targets.py#L398) `MSSQLTarget.write()` | SQL Server: batched inserts into a session temporary table, then one `MERGE`. |
 | [change_capture.py](../change_capture.py#L13) module docstring, "High-water-mark (hwm) state" | Where the watermark is stored, its format, and the four-step cycle. |
-| [change_capture.py](../change_capture.py#L110) `plan_hwm()` | The four steps in code: read the saved watermark, read the ceiling, load and commit, and only then save the new watermark. The watermark is saved only after the target commit in [sync.py](../sync.py#L142) `main()`, so a failed run leaves it unchanged and is retried from the same point. |
+| [change_capture.py](../change_capture.py#L110) `plan_hwm()` | The four steps in code: read the saved watermark, read the ceiling, load and commit, and only then save the new watermark. The watermark is saved only after the target commit in [sync.py](../sync.py#L181) `main()`, so a failed run leaves it unchanged and is retried from the same point. |
 
 ### Run the initial load
 
@@ -213,10 +217,10 @@ cat sync_state.json
 | File | What to show |
 |---|---|
 | [transports.py](../transports.py#L107) `unload_apply()` | Transport B: unload to the stage, retrieve the files, and bulk load. Change capture is the same code as Transport A; only `--transport unload` differs. |
-| [snowflake_source.py](../snowflake_source.py#L253) `unload_to_stage()` | `COPY INTO @stage` writes gzip-compressed CSV files. Snowflake does the export work, in parallel for large results. NULLs are written as a sentinel so they can be told apart from empty strings. |
-| [snowflake_source.py](../snowflake_source.py#L286) `get_files()` | `GET` downloads the files over outbound HTTPS. With an external stage in production, the job reads the bucket with the cloud provider's SDK instead. |
-| [targets.py](../targets.py#L122) `MySQLTarget.bulk_load()` | MySQL: `LOAD DATA LOCAL INFILE ... REPLACE`, the native bulk loader, with sentinel values converted back to NULL. |
-| [targets.py](../targets.py#L358) `MSSQLTarget.bulk_load()` | SQL Server: `BULK INSERT` (or client-side batches) into a text temporary table, sentinel values converted back to NULL, then conversion into a typed temporary table indexed on the key and one `MERGE`. |
+| [snowflake_source.py](../snowflake_source.py#L291) `unload_to_stage()` | `COPY INTO @stage` writes gzip-compressed CSV files. Snowflake does the export work, in parallel for large results. NULLs are written as a sentinel so they can be told apart from empty strings. |
+| [snowflake_source.py](../snowflake_source.py#L327) `get_files()` | `GET` downloads the files over outbound HTTPS. With an external stage in production, the job reads the bucket with the cloud provider's SDK instead. |
+| [targets.py](../targets.py#L142) `MySQLTarget.bulk_load()` | MySQL: `LOAD DATA LOCAL INFILE ... REPLACE`, the native bulk loader, with sentinel values converted back to NULL. |
+| [targets.py](../targets.py#L428) `MSSQLTarget.bulk_load()` | SQL Server: `BULK INSERT` (or client-side batches) into a text temporary table, sentinel values converted back to NULL, then conversion into a typed temporary table indexed on the key and one `MERGE`. |
 
 ### Run the initial load
 
@@ -367,10 +371,10 @@ insert through the stream, once with each transport.
 
 | File | What to show |
 |---|---|
-| [snowflake_source.py](../snowflake_source.py#L130) `consume_stream_to_outbox()` | `INSERT INTO outbox SELECT ... FROM stream` in one transaction. Committing it advances the stream offset; the changes are now held in the outbox. |
+| [snowflake_source.py](../snowflake_source.py#L165) `consume_stream_to_outbox()` | `INSERT INTO outbox SELECT ... FROM stream` in one transaction. Committing it advances the stream offset; the changes are now held in the outbox. |
 | [change_capture.py](../change_capture.py#L149) `plan_stream()` | Consumes the stream, snapshots the cutoff, and plans two queries: rows to upsert and keys to delete. |
-| [snowflake_source.py](../snowflake_source.py#L174) `build_outbox_changes_query()` | Runs in Snowflake: drops the old-value half of each update and keeps the latest change per key (`QUALIFY ROW_NUMBER()`). |
-| [snowflake_source.py](../snowflake_source.py#L209) `purge_outbox()` | After the target commit and the acknowledgement, deletes delivered rows (immediately by default, or after `--outbox-retention-days`). |
+| [snowflake_source.py](../snowflake_source.py#L209) `build_outbox_changes_query()` | Runs in Snowflake: keeps one row per key, from the latest consume and, within a consume, the `INSERT` over the `DELETE` (`QUALIFY ROW_NUMBER()`). An update becomes an upsert; an update that changes a key also deletes the old key. |
+| [snowflake_source.py](../snowflake_source.py#L247) `purge_outbox()` | After the target commit and the acknowledgement, deletes delivered rows (immediately by default, or after `--outbox-retention-days`). |
 
 **Talking points**
 

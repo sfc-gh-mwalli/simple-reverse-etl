@@ -32,6 +32,7 @@ class SnowflakeConfig:
     warehouse: str | None
     database: str | None
     schema: str | None
+    statement_timeout: int | None = None   # STATEMENT_TIMEOUT_IN_SECONDS for the session
 
     @classmethod
     def from_env(cls) -> "SnowflakeConfig":
@@ -49,6 +50,7 @@ class SnowflakeConfig:
             warehouse=_get("SF_WAREHOUSE"),
             database=_get("SF_DATABASE"),
             schema=_get("SF_SCHEMA"),
+            statement_timeout=_get_int("SF_STATEMENT_TIMEOUT_SECONDS"),
         )
         if conn_name:
             return cfg  # credentials come from connections.toml
@@ -70,6 +72,16 @@ def _get_bool(name: str, default: bool) -> bool:
     raise RuntimeError(f"{name} must be yes or no, got {val!r}")
 
 
+def _get_int(name: str) -> int | None:
+    """A positive integer, or None when unset."""
+    val = _get(name)
+    if val is None or val.strip() == "":
+        return None
+    if not val.strip().isdigit() or int(val) <= 0:
+        raise RuntimeError(f"{name} must be a positive whole number, got {val!r}")
+    return int(val)
+
+
 @dataclass
 class TargetConfig:
     kind: str                   # "mysql" | "mssql"
@@ -78,8 +90,12 @@ class TargetConfig:
     database: str
     user: str
     password: str
+    statement_timeout: int | None = None    # seconds a target statement may wait
+    # --- MySQL only ----------------------------------------------------------
+    mysql_ssl_ca: str | None = None         # CA file: verify the server certificate
+    mysql_ssl_verify_identity: bool = True  # with a CA: also check the host name
     # --- SQL Server only -----------------------------------------------------
-    odbc_driver: str | None
+    odbc_driver: str | None = None
     mssql_encrypt: bool = True              # TLS to SQL Server
     mssql_trust_server_cert: bool = False   # True skips certificate validation
     mssql_load_method: str = "bulk_insert"  # Transport B: "bulk_insert" | "client"
@@ -102,6 +118,9 @@ class TargetConfig:
             database=_get("TARGET_DATABASE", required=True),
             user=_get("TARGET_USER", required=True),
             password=_get("TARGET_PASSWORD", required=True),
+            statement_timeout=_get_int("TARGET_STATEMENT_TIMEOUT_SECONDS"),
+            mysql_ssl_ca=_get("TARGET_MYSQL_SSL_CA") or None,
+            mysql_ssl_verify_identity=_get_bool("TARGET_MYSQL_SSL_VERIFY_IDENTITY", True),
             odbc_driver=_get("TARGET_ODBC_DRIVER", "ODBC Driver 18 for SQL Server"),
             mssql_encrypt=_get_bool("TARGET_MSSQL_ENCRYPT", True),
             mssql_trust_server_cert=_get_bool("TARGET_MSSQL_TRUST_SERVER_CERT", False),

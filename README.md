@@ -18,10 +18,16 @@ databases without introducing an additional integration platform.
 - [Choosing a transport](#choosing-a-transport)
 - [Change capture and write semantics](#change-capture-and-write-semantics)
   - [Stream-based change capture](#stream-based-change-capture)
+  - [Key requirements](#key-requirements)
+  - [Data types](#data-types)
 - [Configuration](#configuration)
 - [Usage](#usage)
+- [Failure handling and recovery](#failure-handling-and-recovery)
+- [Operations](#operations)
+- [Security](#security)
 - [Performance](#performance)
 - [Production considerations](#production-considerations)
+- [Tested versions](#tested-versions)
 - [Known limitations](#known-limitations)
 - [Demo](#demo)
 - [Repository layout](#repository-layout)
@@ -68,7 +74,11 @@ rather than result size.
 the files, and loads them with the target database's native bulk loader
 (`LOAD DATA LOCAL INFILE` on MySQL, `BULK INSERT` on SQL Server). Snowflake does the
 extraction in parallel, and the target load reads local files rather than a live result
-set. The files of the last run stay in `--local-dir` until the next run and on the stage
+set. Each run first empties the stage path for the target and then unloads with
+`INCLUDE_QUERY_ID = TRUE`, which the documentation recommends over `OVERWRITE = TRUE`
+because after an internal retry "Snowflake deletes the partial set of unloaded files"
+([COPY INTO \<location\>](https://docs.snowflake.com/en/sql-reference/sql/copy-into-location)).
+The files of the last run stay in `--local-dir` until the next run and on the stage
 until the next run for the same target, so a failed load can be inspected; a rerun
 unloads again. Each run empties `--local-dir` first, so give each target its own folder
 if runs for different targets can overlap.
@@ -76,6 +86,133 @@ if runs for different targets can overlap.
 The code follows the same split: [change_capture.py](change_capture.py) builds a plan of
 what to send, [transports.py](transports.py) moves it, [targets.py](targets.py) writes to
 MySQL or SQL Server, and [sync.py](sync.py) commits the target and then records progress.
+
+## Failure handling and recovery
+
+The job has no internal retry. A failed run leaves the target and the recorded progress
+in a state from which the next scheduled run (or a manual rerun) continues correctly, and
+reports what happened through its exit code.
+
+| Exit code | Meaning | Target | Progress (watermark or outbox) | Action |
+|---|---|---|---|---|
+| 0 | Success, or nothing to send | Committed | Advanced | None |
+| 1 | The run failed | Rolled back (see the exceptions below) | Unchanged | Rerun after fixing the cause |
+| 2 | Invalid options | Untouched; nothing connected | Unchanged | Fix the command line |
+| 3 | Another run for the same target holds the lock | Untouched | Unchanged | None; the next run proceeds |
+| 4 | The target committed, but saving progress failed | Committed | Not advanced | Rerun; it re-sends the same rows |
+
+Exceptions to "rolled back": Transport A with `none` or `hwm` keeps the batches committed
+before the failure (`--commit-rows`), and on MySQL `TRUNCATE TABLE` causes an implicit
+commit, so a failed full load can leave the table empty or partly loaded. In both cases
+the rerun completes the load (tested).
+
+**What was tested.** [demo/verify_recovery.py](demo/verify_recovery.py) runs every
+combination of change capture and write mode (`none`/`truncate`, `hwm`/`upsert`,
+`hwm`/`append`, `stream`/`upsert`) with both transports, and injects each of these
+failures in turn:
+
+- the Snowflake read or unload fails
+- the target write fails part-way (after some rows are written)
+- the target commit fails
+- saving the watermark or acknowledging the outbox fails after the target committed
+- the process is killed (no rollback, no clean disconnect) right after a write
+
+Before the failure the source receives inserts, an update, and, where the mode can see
+them, a delete and an `UPDATE` that changes the key value. After each failure the job is
+run twice more without a failure, and the target is compared with Snowflake. On MySQL 8.4,
+SQL Server 2022 with `bulk_insert`, and SQL Server 2022 with `client`, all 38 applicable
+scenarios ended with the target matching the source, the failed run exiting non-zero, and
+both later runs exiting 0. The only difference from the source was the documented one: with
+`hwm` and `--mode append`, two or three rows were delivered twice after a Transport A
+partial commit or a progress-save failure.
+
+**Runbook.**
+
+- *A run failed (exit 1).* Read the logged error, fix the cause, and rerun. No cleanup is
+  needed. A Transport B run starts by emptying `--local-dir` and the stage path for the
+  target.
+- *Progress was not saved (exit 4).* Rerun. With upserts the result is unchanged; with
+  `--mode append` remove the duplicates or reload.
+- *The run reported the lock (exit 3) unexpectedly.* Another run is active for the same
+  target, possibly still in progress from an earlier schedule. The lock belongs to that
+  run's database session and is released when it ends, including when the process is
+  killed and the connection drops (tested).
+- *Reload a target from scratch.* For `hwm`, remove the target's entry from the state file
+  (or the file) and run with `--mode upsert`, or run a full load
+  (`--change-capture none --mode truncate`) first. For `stream`, run a full load; pending
+  outbox changes are then applied again on the next stream run, which is harmless.
+- *The stream is stale or the source table was replaced.* Recreate the stream, run a full
+  load, and resume stream runs (see
+  [Stream-based change capture](#stream-based-change-capture)).
+
+## Operations
+
+- **One run per target at a time.** At start the job takes a lock named after
+  `--target` in the target database (MySQL `GET_LOCK`, SQL Server `sp_getapplock` owned by
+  the session) and exits with code 3 if another run holds it. Both are released when the
+  session ends. The lock does not cover a shared `--local-dir`: give each target its own
+  folder.
+- **Run summary.** Each run logs one line beginning `RUN_SUMMARY` followed by JSON with
+  the status (`ok`, `no_changes`, `failed`, `locked`, `state_not_saved`), source, target,
+  change capture, transport, mode, rows written and deleted, and duration. Collect it with
+  the scheduler's logs to alert on failures and track volumes.
+- **Query tag.** The job's Snowflake session sets `QUERY_TAG` to
+  `simple-reverse-etl:<target>`, so its queries and their warehouse time can be found in
+  query history.
+- **Timeouts.** By default nothing times out. `SF_STATEMENT_TIMEOUT_SECONDS` sets the
+  session's `STATEMENT_TIMEOUT_IN_SECONDS` (tested: a longer statement is cancelled with
+  "Statement reached its statement or warehouse timeout"). `TARGET_STATEMENT_TIMEOUT_SECONDS`
+  sets the MySQL client read and write timeouts or the `pyodbc` query timeout for SQL
+  Server. Set them above the longest expected statement; a timeout fails the run (exit 1).
+  The Python connector's own `network_timeout` is "By default, none/infinite"
+  ([connector API](https://docs.snowflake.com/en/developer-guide/python-connector/python-connector-api)).
+- **Monitoring.** Alert on non-zero exit codes. In stream mode also watch `STALE_AFTER`
+  (`SHOW STREAMS`) and the number of un-exported outbox rows
+  (`SELECT COUNT_IF(NOT _CDC_EXPORTED) FROM <outbox>`), which grows when runs fail.
+- **Many tables.** Run one job per table. Tables are synchronized independently and at
+  different times, so foreign keys between target tables can be violated between runs;
+  load parent tables first, or do not enforce those foreign keys on the target.
+- **Schema changes.** The job selects `SELECT * FROM <source>`. Adding a source column
+  makes runs fail (exit 1, tested on both targets) until the target has the column; dropping or renaming one requires the
+  same change on the target. A view as `--source` (tested with `none` and `hwm`) pins the
+  projection so that source changes do not reach the target unplanned.
+
+## Security
+
+- **Credentials.** Use key-pair authentication for the Snowflake service user, and supply
+  credentials from a secret store rather than a file on the job host.
+- **Snowflake privileges.** The job's role needs `USAGE` on the warehouse, database, and
+  schema and `SELECT` on the source (for a view, "the SELECT privilege is not required on
+  the objects from which the view is created"). Stream mode also needs `SELECT` on the
+  stream and `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on the outbox. Transport B with an
+  internal stage needs `WRITE` ("PUT, REMOVE, COPY INTO <location>") and `READ` ("GET,
+  LIST") on the stage ([privileges](https://docs.snowflake.com/en/user-guide/security-access-control-privileges)).
+  The demo ran with an administrative role; these grants are taken from the documentation
+  and were not tested with a least-privilege role.
+- **Governance policies carry through.** For unloads the documentation states: "If a
+  masking policy is set on a column, the masking policy is applied to the data resulting
+  in unauthorized users seeing masked data in the column"
+  ([COPY INTO \<location\>](https://docs.snowflake.com/en/sql-reference/sql/copy-into-location)).
+  The job receives what its role is allowed to see, so masked values are what reach the
+  target. Grant the job's role access deliberately.
+- **Data at rest.** Files on an internal stage are "client-side encrypted by
+  default"; files downloaded by `GET` are written with permissions `600` by default. The
+  decompressed CSV files in `--local-dir` are plain text and stay until the next run for
+  that target. Put `--local-dir` on an encrypted volume readable only by the job (and, for
+  `bulk_insert`, by the SQL Server service account).
+- **Connections to the target.** SQL Server connections are encrypted and the certificate
+  is verified by default (`TARGET_MSSQL_ENCRYPT`, `TARGET_MSSQL_TRUST_SERVER_CERT`). For
+  MySQL, PyMySQL negotiated TLS with the test server without any setting
+  (`Ssl_cipher` `TLS_AES_256_GCM_SHA384`) but did not verify the certificate. Set
+  `TARGET_MYSQL_SSL_CA` to verify it; tested: the server's CA was accepted and an unrelated
+  CA was rejected. Host-name checking (`TARGET_MYSQL_SSL_VERIFY_IDENTITY`, default `yes`)
+  requires a certificate issued for the host name used in `TARGET_HOST`.
+- **Input handling.** Table, column, stream, outbox, and stage names given on the command
+  line are checked against a plain-identifier pattern before they are used in SQL; values
+  are always bound as parameters.
+- **Logs.** Driver errors are logged as reported by the database and can include key
+  values (tested: MySQL reported `Duplicate entry '1' for key ...`). Treat job logs as
+  containing data.
 
 ## Network and firewall requirements
 
@@ -191,6 +328,26 @@ much faster on MySQL but not necessarily on SQL Server (see
   on durable storage in production, or replace `load_state`/`save_state` in
   [change_capture.py](change_capture.py) with a control
   table or scheduler variable.
+
+  Three properties of the watermark, each confirmed by test
+  ([demo/verify_edge_cases.py](demo/verify_edge_cases.py) and
+  [demo/verify_recovery.py](demo/verify_recovery.py)):
+
+  - *Rows with a `NULL` `--hwm-col` are never sent*, because the window is
+    `watermark < col <= ceiling`. Make the column `NOT NULL`, or point `--source` at a
+    view that supplies a value.
+  - *Late commits are missed.* `CURRENT_TIMESTAMP` is evaluated per statement, not at
+    commit. A row stamped inside a transaction that commits after a run has advanced the
+    watermark past that stamp is never sent. Snowflake's documentation also advises:
+    "Do not use the returned value for precise time ordering between concurrent queries"
+    ([CURRENT_TIMESTAMP](https://docs.snowflake.com/en/sql-reference/functions/current_timestamp)).
+    Use `hwm` only where the column is set by a single writer that commits promptly, or
+    use `stream`.
+  - *With `--mode append`, a retry can insert rows twice.* After a Transport A run that
+    committed some batches and then failed, or after any run whose target commit
+    succeeded but whose watermark could not be saved (exit code 4), the next run re-sends
+    the window. Upserts absorb this; appends do not. Prefer `--mode upsert`; use `append`
+    only for targets that tolerate or remove duplicates.
 - `stream` — Both transports. Uses a Snowflake stream instead of a watermark column, and
   also propagates deletes. See [Stream-based change capture](#stream-based-change-capture).
 
@@ -204,7 +361,7 @@ much faster on MySQL but not necessarily on SQL Server (see
 | Position stored in | JSON state file on the job host | Stream offset and outbox table in Snowflake |
 | Snowflake objects to create | None | Stream and outbox table |
 | Transports | A and B | A and B |
-| Operational risk | Rows updated without changing the column are missed | Stream becomes stale if not consumed within the retention period |
+| Operational risk | Rows updated without changing the column, rows with a `NULL` column, and rows committed after the watermark passed their value are missed | Stream becomes stale if not consumed within the retention period |
 
 ### Stream-based change capture
 
@@ -221,9 +378,12 @@ reliable across two systems that cannot share a transaction:
 2. **Snapshot and reduce.** The job records the newest `_CDC_LOADED_AT` among outbox rows
    not yet exported (the cutoff) and handles only rows up to it. A stream represents an
    update as two rows: a `DELETE` with the old values and an `INSERT` with the new values,
-   both with `METADATA$ISUPDATE = TRUE`. A query in Snowflake discards the old-value rows
-   and keeps only the most recent change for each key (`QUALIFY ROW_NUMBER() ...`), so the
-   outbox can safely hold the changes from several consumes.
+   both with `METADATA$ISUPDATE = TRUE`. A query in Snowflake keeps one row per key: the
+   row from the most recent consume, and within one consume the `INSERT` over the
+   `DELETE`. An ordinary update therefore becomes an upsert with the new values, and an
+   `UPDATE` that changes a `--key-cols` value deletes the old key (its `DELETE` half is
+   the only row for that key) and upserts the new one. The outbox can safely hold the
+   changes from several consumes.
 3. **Apply.** Remaining inserts are upserted on `--key-cols`, and plain deletes are deleted
    by key, in one target transaction. Transport A reads the reduced result in Arrow
    batches. Transport B unloads it twice, as full rows to `<stage>/<target>/upsert/` and
@@ -240,7 +400,33 @@ If the job fails after step 1, the changes stay in the outbox and are applied on
 run. If it fails after step 3 but before step 4, they are applied again. Upserts and
 deletes by key are idempotent, so delivery is at-least-once with a correct final state.
 A failure between steps 4 and 5 leaves delivered rows in the outbox until the next
-successful run purges them.
+successful run purges them. These cases are exercised by the recovery tests; see
+[Failure handling and recovery](#failure-handling-and-recovery).
+
+**Why an outbox.** Snowflake and the target database cannot take part in one
+transaction, so the job needs a durable record, on the Snowflake side, of changes that
+have left the stream but are not yet confirmed in the target. The relevant documented
+behavior:
+
+- "A stream advances the offset only when it is used in a DML transaction." Reading a
+  stream with `SELECT` and then loading the target would leave no way to advance the
+  offset to exactly what was delivered.
+- The alternative is to read the stream inside an explicit transaction, which holds the
+  stream at the point the transaction began, and commit after the target load. That ties
+  delivery to one Snowflake session staying open for the whole load. If that session
+  "disconnects abruptly", the transaction "is left in a detached state, including any
+  locks that the transaction is holding", and is only aborted automatically after it
+  blocks another transaction and is idle for 5 minutes, or after 4 hours
+  ([Transactions](https://docs.snowflake.com/en/sql-reference/transactions)).
+
+The outbox instead commits the consume immediately and records delivery separately, so no
+Snowflake transaction stays open while the on-premises load runs, a run can fail at any
+point without holding locks, and the changes in flight are visible and queryable.
+
+**Late-committing transactions.** Stream mode delivers rows that a source transaction
+stamped early but committed late; a watermark does not (see
+[Choosing `hwm` or `stream`](#change-capture-and-write-semantics)). Both were tested by
+committing a row in a second session after a run had moved past its timestamp.
 
 **Setup.** Run once, as described in [sql/01_snowflake_setup.sql](sql/01_snowflake_setup.sql):
 
@@ -292,6 +478,60 @@ outbox.
 converted back to `NULL` during the bulk load, so `NULL` and empty strings remain distinct
 through the round trip.
 
+### Key requirements
+
+`--key-cols` names the columns that identify a row. Snowflake does not check that they are
+unique: "For standard tables, NOT NULL and CHECK are the only types of constraints that are
+enforced by Snowflake"
+([constraints](https://docs.snowflake.com/en/sql-reference/sql/create-table-constraint)).
+The source must therefore be unique on `--key-cols`, and the target needs a primary key or
+unique index on the same columns. The tests showed what happens when this does not hold:
+
+- *Duplicate keys in the source.* SQL Server fails the run (exit code 1, target unchanged).
+  MySQL loads one of the duplicates without an error, and which one differs between
+  transports and modes. Check uniqueness in Snowflake, for example with
+  `SELECT key, COUNT(*) FROM source GROUP BY key HAVING COUNT(*) > 1`, or deduplicate in a
+  source view.
+- *Keys that differ only by letter case.* Snowflake compares strings case-sensitively by
+  default (`'abc' = 'ABC'` is false), but the collations of the test databases were
+  case-insensitive (MySQL 8.4 `utf8mb4_0900_ai_ci`, SQL Server
+  `SQL_Latin1_General_CP1_CI_AS`). SQL Server fails the run;
+  MySQL silently merges the two rows. A binary collation on the target key column
+  (`utf8mb4_bin` on MySQL, for example `Latin1_General_100_BIN2` on SQL Server) kept both
+  rows on both targets.
+- *Generated key columns.* A SQL Server `IDENTITY` key cannot receive source values (the
+  run fails); MySQL `AUTO_INCREMENT` accepts them. Columns that exist only in the target,
+  such as an `IDENTITY` surrogate or a defaulted load timestamp, are left to the target and
+  worked with both transports.
+
+### Data types
+
+[demo/verify_edge_cases.py](demo/verify_edge_cases.py) loads one value of each type below
+through both transports into both targets and compares it with Snowflake. Target column
+types are chosen by the user; the table lists the types that were tested.
+
+| Snowflake type | MySQL column | SQL Server column | Result |
+|---|---|---|---|
+| `NUMBER(38,0)`, `NUMBER(18,6)` | `DECIMAL` | `DECIMAL` | Exact, both transports |
+| `FLOAT` | `DOUBLE` | `FLOAT(53)` | Exact with Transport A. Transport B: "Snowflake truncates the values to approximately (15,9)" when unloading to CSV ([unloading considerations](https://docs.snowflake.com/en/user-guide/data-unload-considerations)); for example `3.141592653589793` arrives as `3.141592654`. Use Transport A for `FLOAT` columns that need full precision. |
+| `DATE`, including `0001-01-01` | `DATE` | `DATE` | Exact |
+| `TIME(6)` | `TIME(6)` | `TIME(6)` | Exact to the microsecond |
+| `TIMESTAMP_NTZ(6)` | `DATETIME(6)` | `DATETIME2(6)` | Exact to the microsecond |
+| `TIMESTAMP_LTZ(6)` | `DATETIME(6)` | `DATETIME2(6)` | Correct instant, written as wall-clock time in a session time zone. In the test, Snowflake (`TIMEZONE`) and MySQL both used UTC. Set the job user's `TIMEZONE` parameter deliberately. |
+| `TIMESTAMP_TZ(6)` | `DATETIME(6)` | `DATETIMEOFFSET(6)` | SQL Server keeps the instant. MySQL `DATETIME` has no offset: Transport A stored the UTC time, Transport B the local time of the original offset. Convert explicitly in a source view if a MySQL target needs it. |
+| `BOOLEAN` | `TINYINT(1)` | `BIT` | Exact (Transport B maps `true`/`false` to 1/0) |
+| `BINARY` | `VARBINARY` | `VARBINARY` | Exact (Transport B decodes the unloaded hex) |
+| `VARCHAR` (5,000 characters, non-ASCII, quotes, newlines) | `TEXT` | `NVARCHAR(MAX)` | Exact |
+| `VARIANT`, `OBJECT` | `JSON` | `NVARCHAR(MAX)` | Same JSON value. The text differs: Transport A writes indented JSON. |
+| `ARRAY` | `JSON` | `NVARCHAR(MAX)` | An array containing SQL `NULL` is rendered as `undefined`, which is not valid JSON; MySQL `JSON` columns reject it (the run fails). |
+| `GEOGRAPHY` | `TEXT` | `NVARCHAR(MAX)` | Written as GeoJSON text |
+
+The job reads `NUMBER` columns as exact decimals (the connector's default would return
+`NUMBER` columns with a scale as 64-bit floating point, which loses precision beyond about
+15 digits), and binds decimals to SQL Server as text, because `pyodbc` with
+`fast_executemany` rounds long decimals. For Transport B it sets the session's timestamp,
+time, and date output formats to keep microseconds and write offsets as `+hh:mm`.
+
 ## Configuration
 
 Configuration is read from environment variables; [.env.example](.env.example) provides a
@@ -314,6 +554,10 @@ or secret store.
 | `TARGET_MSSQL_TRUST_SERVER_CERT` | SQL Server: skip server certificate validation (default `no`). Set `yes` only for test servers with self-signed certificates. |
 | `TARGET_MSSQL_LOAD_METHOD` | SQL Server, Transport B: `bulk_insert` (default) or `client`. See [SQL Server targets](#sql-server-targets). |
 | `TARGET_MSSQL_BULK_DIR` | SQL Server, `bulk_insert` only: the `--local-dir` folder as SQL Server sees it, for example `\\fileserver\share\unload`. |
+| `TARGET_MYSQL_SSL_CA` | MySQL: CA certificate file. When set, the server certificate is verified. See [Security](#security). |
+| `TARGET_MYSQL_SSL_VERIFY_IDENTITY` | MySQL, with a CA: also check the server host name (default `yes`). |
+| `SF_STATEMENT_TIMEOUT_SECONDS` | Optional Snowflake statement timeout for the job's session. |
+| `TARGET_STATEMENT_TIMEOUT_SECONDS` | Optional timeout for each target statement. |
 | `LOG_LEVEL` | Python logging level (default `INFO`). |
 
 **Authentication.** For unattended execution, use
@@ -366,11 +610,11 @@ python sync.py --transport unload \
     --stage @~/simple_reverse_etl --local-dir /var/lib/simple-reverse-etl/unload
 ```
 
-The job exits non-zero on failure, rolls back the target transaction, and leaves the
-watermark or outbox state unchanged. Invalid option combinations exit with code 2 before
-connecting, including options that do not apply to the chosen transport (for example
-`--stage` with `pull`, or `--commit-rows` with `unload`). Run
-`python sync.py --help` for the full option list.
+Invalid option combinations exit with code 2 before connecting, including options that
+do not apply to the chosen transport (for example `--stage` with `pull`, or
+`--commit-rows` with `unload`) and names that are not plain identifiers. Run
+`python sync.py --help` for the full option list. Exit codes and recovery are described in
+[Failure handling and recovery](#failure-handling-and-recovery).
 
 **Transactions.** Transport B and stream mode apply each run in one target transaction.
 Transport A with `none` or `hwm` commits about every `--commit-rows` rows (default
@@ -510,8 +754,8 @@ for that. Results on the emulated SQL Server varied by up to about 30% between r
 - **Secrets.** Do not deploy a populated `.env` file. Supply credentials from an approved
   secret store and prefer key-pair authentication over passwords or long-lived tokens.
 - **Scheduling.** The job has no scheduler of its own. Invoke it from the orchestrator
-  already in use (cron, Airflow, Control-M, and so on). Runs for a given target should not
-  overlap.
+  already in use (cron, Airflow, Control-M, and so on) and act on its exit code. Overlapping
+  runs for one target are refused with exit code 3.
 - **Target schema.** Target tables must exist before the first run, with column names
   matching the source projection and a key that supports the chosen upsert. Target
   privileges are listed under [MySQL targets](#mysql-targets) and
@@ -526,6 +770,25 @@ for that. Results on the emulated SQL Server varied by up to about 30% between r
 - **Stream retention.** In stream mode, schedule runs well inside the stream's
   `STALE_AFTER` window; see [Stream-based change capture](#stream-based-change-capture).
 
+## Tested versions
+
+The test suites in [demo/](demo/) ran on macOS (Apple silicon) with Python 3.11.6,
+Snowflake Connector for Python 4.8.0, PyMySQL 1.2.3, pyodbc 5.3.0 with Microsoft ODBC
+Driver 18 for SQL Server, MySQL 8.4.11, and SQL Server 2022 (16.0.4295, in Docker under
+x86 emulation). [requirements-lock.txt](requirements-lock.txt) records every Python
+package version used; install with
+`pip install -r requirements.txt -c requirements-lock.txt`. Linux and Windows job hosts,
+other database versions, and network-share `BULK INSERT` were not tested.
+
+| Suite | What it checks |
+|---|---|
+| [demo/run_demo.sh](demo/run_demo.sh) | End-to-end demo: full, watermark, and stream loads with both transports |
+| [demo/verify_fidelity.sh](demo/verify_fidelity.sh) | `NULL`, empty strings, non-ASCII text, quotes, newlines, booleans |
+| [demo/verify_recovery.sh](demo/verify_recovery.sh) | Injected failures and restarts for every mode and transport |
+| [demo/verify_edge_cases.sh](demo/verify_edge_cases.sh) | Data types, key requirements, `NULL` watermarks, late commits, views |
+| [demo/verify_operations.sh](demo/verify_operations.sh) | Run lock, query tag, timeouts, exit codes, MySQL certificate verification |
+| `python -m pytest tests` | Option validation and query construction (no database; also run in CI) |
+
 ## Known limitations
 
 - SQL Server `BULK INSERT` has been tested with a folder mounted into the SQL Server
@@ -534,6 +797,8 @@ for that. Results on the emulated SQL Server varied by up to about 30% between r
 - Retrieval from external stages (cloud SDK instead of `GET`) and Snowflake-scheduled
   unloads are described above but not implemented.
 - Schema evolution is not managed; source and target structures must be kept aligned.
+- No built-in retries, parallelism within a table, or multi-table consistency; see
+  [Operations](#operations).
 
 ## Demo
 
@@ -555,7 +820,8 @@ targets.py            MySQL and SQL Server writers (upsert, delete, bulk load, b
 snowflake_source.py   Connection, Arrow reads, unload and GET, stream and outbox helpers
 config.py             Environment-based configuration for Snowflake and the target
 sql/                  One-time Snowflake setup for stream-based change capture
-demo/                 Docker and Snowflake demonstration (MySQL or SQL Server)
+tests/                Unit tests (no database needed)
+demo/                 Docker and Snowflake demonstration and test suites (MySQL or SQL Server)
 ```
 
 ## License

@@ -46,9 +46,12 @@ Examples
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import re
 import sys
+import time
 
 import snowflake_source as sf
 from change_capture import PLANNERS
@@ -61,6 +64,22 @@ log = logging.getLogger("sync")
 DEFAULT_COMMIT_ROWS = 100_000
 DEFAULT_STAGE = "@~/simple_reverse_etl"
 DEFAULT_LOCAL_DIR = "_unload_tmp"
+
+# Exit codes (for schedulers and alerting).
+EXIT_OK = 0           # success, or nothing to send
+EXIT_FAILED = 1       # run failed; target rolled back, progress unchanged; rerun
+EXIT_USAGE = 2        # invalid options; nothing was done
+EXIT_LOCKED = 3       # another run for this target holds the lock; nothing was done
+EXIT_STATE = 4        # target committed, but saving progress failed; rerun re-sends
+
+# Identifiers are interpolated into SQL, so they are restricted to plain names
+# (letters, digits, _ and $), optionally dot-qualified. Double-quoted parts are
+# allowed for Snowflake names, as long as they contain no quote characters.
+_PART = r'(?:[A-Za-z_][A-Za-z0-9_$]*|"[^"]+")'
+_SF_NAME = re.compile(rf"^{_PART}(?:\.{_PART}){{0,2}}$")
+_TARGET_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)?$")
+_COLUMN = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+_STAGE = re.compile(rf"^@(?:~|%?{_PART}(?:\.{_PART}){{0,2}})(?:/[A-Za-z0-9_./-]*)?$")
 
 
 def parse_args(argv=None):
@@ -112,6 +131,17 @@ def parse_args(argv=None):
 
 def validate(args) -> str | None:
     """Returns an error message, or None. Also fills transport defaults."""
+    for flag, value, pattern in (("--source", args.source, _SF_NAME),
+                                 ("--stream", args.stream, _SF_NAME),
+                                 ("--outbox", args.outbox, _SF_NAME),
+                                 ("--target", args.target, _TARGET_NAME),
+                                 ("--hwm-col", args.hwm_col, _COLUMN),
+                                 ("--stage", args.stage, _STAGE)):
+        if value is not None and not pattern.match(value):
+            return f"{flag} {value!r} is not a valid name"
+    for col in args.key_cols or []:
+        if not _COLUMN.match(col):
+            return f"--key-cols {col!r} is not a valid column name"
     if args.mode == "upsert" and not args.key_cols:
         return "--mode upsert requires --key-cols"
     if args.change_capture == "hwm":
@@ -139,6 +169,15 @@ def validate(args) -> str | None:
     return None
 
 
+def _summary(args, status: str, started: float, written=0, deleted=0) -> None:
+    """One machine-readable line per run, for log collection and alerting."""
+    log.info("RUN_SUMMARY %s", json.dumps({
+        "status": status, "source": args.source, "target": args.target,
+        "change_capture": args.change_capture, "transport": args.transport,
+        "mode": args.mode, "rows_written": written, "rows_deleted": deleted,
+        "seconds": round(time.monotonic() - started, 1)}))
+
+
 def main(argv=None) -> int:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -148,17 +187,27 @@ def main(argv=None) -> int:
     error = validate(args)
     if error:
         log.error(error)
-        return 2
+        return EXIT_USAGE
+    started = time.monotonic()
 
-    sf_conn = sf.connect(SnowflakeConfig.from_env())
+    # The target connection is opened first so that its lock is held before
+    # anything in Snowflake (stream consume, unload) is touched.
     target = make_target(TargetConfig.from_env())
+    if not target.acquire_lock(args.target):
+        log.error("Another run for target %s holds the lock; nothing was done", args.target)
+        target.close()
+        _summary(args, "locked", started)
+        return EXIT_LOCKED
+    sf_conn = sf.connect(SnowflakeConfig.from_env(),
+                         query_tag=f"simple-reverse-etl:{args.target}")
     try:
         # 1. Change capture decides which rows to send (None: nothing to do).
         plan = PLANNERS[args.change_capture](sf_conn, args)
         if plan is None:
             target.close()
             sf_conn.close()
-            return 0
+            _summary(args, "no_changes", started)
+            return EXIT_OK
         # 2. The transport moves them into the target.
         written, deleted = TRANSPORTS[args.transport](sf_conn, target, plan, args)
         # 3. Commit the target, then advance watermark / acknowledge the outbox.
@@ -168,16 +217,19 @@ def main(argv=None) -> int:
         log.exception("Sync failed; target transaction rolled back")
         target.close()
         sf_conn.close()
-        return 1
+        _summary(args, "failed", started)
+        return EXIT_FAILED
     try:
         plan.on_commit()
         log.info(plan.summary(written, deleted))
-        return 0
+        _summary(args, "ok", started, written, deleted)
+        return EXIT_OK
     except Exception:
         # The target is committed; only the state update failed. The next run
-        # re-sends the same rows, which the key-based upsert makes harmless.
+        # re-sends the same rows: harmless for upserts, duplicates for append.
         log.exception("Target committed, but saving watermark/outbox state failed")
-        return 1
+        _summary(args, "state_not_saved", started, written, deleted)
+        return EXIT_STATE
     finally:
         target.close()
         sf_conn.close()

@@ -1,4 +1,6 @@
-# Dependencies for the demo scripts.
+# Dependencies for the demo scripts, at the versions in requirements-lock.txt.
+-c ../requirements-lock.txt
+pytest
 # secure-local-storage adds keyring so an SSO id-token can be cached between sessions.
 snowflake-connector-python[pandas,secure-local-storage]>=3.12
 PyMySQL>=1.1

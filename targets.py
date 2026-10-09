@@ -45,6 +45,12 @@ class MySQLTarget:
     def __init__(self, cfg):
         import pymysql
 
+        # TLS: PyMySQL negotiates TLS when the server offers it, but checks the
+        # server certificate only when a CA file is given.
+        tls = {}
+        if cfg.mysql_ssl_ca:
+            tls = {"ssl_ca": cfg.mysql_ssl_ca, "ssl_verify_cert": True,
+                   "ssl_verify_identity": cfg.mysql_ssl_verify_identity}
         self.conn = pymysql.connect(
             host=cfg.host,
             port=cfg.port,
@@ -54,7 +60,19 @@ class MySQLTarget:
             charset="utf8mb4",
             autocommit=False,
             local_infile=True,   # required for LOAD DATA LOCAL INFILE (Transport B)
+            # Seconds to wait for the server to answer a statement (None: forever).
+            read_timeout=cfg.statement_timeout,
+            write_timeout=cfg.statement_timeout,
+            **tls,
         )
+
+    def acquire_lock(self, name: str) -> bool:
+        """Take a server-wide named lock without waiting. It is held until the
+        connection closes, across commits (MySQL GET_LOCK)."""
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT GET_LOCK(%s, 0)", (_lock_name(name, 64),))
+            self._lock = _lock_name(name, 64) if cur.fetchone()[0] == 1 else None
+        return self._lock is not None
 
     def truncate(self, table: str) -> None:
         # Note: MySQL TRUNCATE commits implicitly; a failed load after it leaves
@@ -87,18 +105,23 @@ class MySQLTarget:
         with self.conn.cursor() as cur:
             cur.executemany(f"DELETE FROM {table} WHERE {where}", key_rows)
 
-    def _load_data_sql(self, into: str, columns, verb: str = "") -> str:
+    def _load_data_sql(self, into: str, columns, verb: str = "", types_of: str | None = None) -> str:
         """LOAD DATA LOCAL INFILE for an unload CSV. Each field is read into a
         user variable, then NULLIF turns NULL_TOKEN back into a real NULL (empty
-        strings stay ''). Snowflake unloads BOOLEAN as true/false, which MySQL
-        rejects for TINYINT(1)/BIT columns, so those columns map it to 1/0."""
-        flags = self._flag_columns(into)
+        strings stay ''). Two Snowflake text forms need converting: BOOLEAN is
+        unloaded as true/false, which MySQL rejects for TINYINT(1)/BIT columns,
+        so those map to 1/0; BINARY is unloaded as hex, so binary columns are
+        decoded with UNHEX. Column types come from `types_of` (default `into`)."""
+        types = self._column_types(types_of or into)
         variables = [f"@v{i}" for i in range(len(columns))]
 
         def value(c, v):
             plain = f"NULLIF({v}, '{NULL_TOKEN}')"
-            if c.lower() in flags:
+            kind = types.get(c.lower())
+            if kind in ("tinyint", "bit"):
                 return f"CASE {v} WHEN 'true' THEN 1 WHEN 'false' THEN 0 ELSE {plain} END"
+            if kind in ("binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob"):
+                return f"UNHEX({plain})"
             return plain
 
         set_clause = ", ".join(f"`{c}` = {value(c, v)}" for c, v in zip(columns, variables))
@@ -109,15 +132,12 @@ class MySQLTarget:
             f"({', '.join(variables)}) SET {set_clause}"
         )
 
-    def _flag_columns(self, table: str) -> set[str]:
-        """Lower-case names of TINYINT and BIT columns in `table` (where a
-        Snowflake BOOLEAN lands). Temporary tables are not listed, which is
-        fine: they only hold key columns."""
+    def _column_types(self, table: str) -> dict[str, str]:
+        """{lower-case column name: DATA_TYPE} for `table` in the current database."""
         with self.conn.cursor() as cur:
-            cur.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
-                        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s "
-                        "AND DATA_TYPE IN ('tinyint', 'bit')", (table,))
-            return {r[0].lower() for r in cur.fetchall()}
+            cur.execute("SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS "
+                        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s", (table,))
+            return {r[0].lower(): r[1].lower() for r in cur.fetchall()}
 
     def bulk_load(self, table, csv_path, columns, mode="upsert", key_columns=None,
                   rel_path=None) -> None:
@@ -138,7 +158,8 @@ class MySQLTarget:
             cur.execute("DROP TEMPORARY TABLE IF EXISTS _sre_delete_keys")
             cur.execute(f"CREATE TEMPORARY TABLE _sre_delete_keys "
                         f"SELECT {keys} FROM {table} WHERE 1 = 0")
-            cur.execute(self._load_data_sql("_sre_delete_keys", key_columns), (csv_path,))
+            cur.execute(self._load_data_sql("_sre_delete_keys", key_columns, types_of=table),
+                        (csv_path,))
             cur.execute(f"DELETE t FROM {table} t JOIN _sre_delete_keys d ON {on}")
             cur.execute("DROP TEMPORARY TABLE _sre_delete_keys")
 
@@ -149,6 +170,12 @@ class MySQLTarget:
         self.conn.rollback()
 
     def close(self):
+        if getattr(self, "_lock", None):
+            try:
+                with self.conn.cursor() as cur:
+                    cur.execute("DO RELEASE_LOCK(%s)", (self._lock,))
+            except Exception:  # noqa: BLE001 - closing the session releases it anyway
+                pass
         self.conn.close()
 
 
@@ -190,6 +217,8 @@ class MSSQLTarget:
             f"TrustServerCertificate={'yes' if cfg.mssql_trust_server_cert else 'no'}",
         ])
         self.conn = pyodbc.connect(conn_str, autocommit=False)
+        if cfg.statement_timeout:
+            self.conn.timeout = cfg.statement_timeout   # per statement, in seconds
         self.load_method = cfg.mssql_load_method
         self.bulk_dir = cfg.mssql_bulk_dir
         if self.load_method == "bulk_insert" and not self.bulk_dir:
@@ -212,6 +241,8 @@ class MSSQLTarget:
         - strings: Unicode (SQL_WVARCHAR). Without this, strings bound to
           NVARCHAR(MAX) columns are sent as non-Unicode and characters outside
           the server code page (for example CJK) become '?'.
+
+        Decimals are converted to text beforehand (see _exact_decimals).
         """
         import datetime
         import pyodbc
@@ -230,6 +261,24 @@ class MSSQLTarget:
                 sizes.append(None)
         if any(sizes):
             cur.setinputsizes(sizes)
+
+    @staticmethod
+    def _exact_decimals(rows):
+        """Send Decimal values as text, which SQL Server converts exactly. With
+        fast_executemany, pyodbc rounds Decimals beyond about 15 significant
+        digits, even when the parameter precision is declared."""
+        import decimal
+        if not any(isinstance(v, decimal.Decimal) for r in rows for v in r):
+            return rows
+        return [tuple(format(v, "f") if isinstance(v, decimal.Decimal) else v for v in r)
+                for r in rows]
+
+    def _column_types(self, cur, table: str) -> dict[str, str]:
+        """{lower-case column name: DATA_TYPE} for `table`."""
+        cur.execute("SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_NAME = PARSENAME(?, 1) "
+                    "AND TABLE_SCHEMA = COALESCE(PARSENAME(?, 2), SCHEMA_NAME())", table, table)
+        return {r[0].lower(): r[1].lower() for r in cur.fetchall()}
 
     def _typed_temp(self, cur, temp: str, table: str, columns) -> None:
         """Create #temp with the same types as `columns` in `table` (no IDENTITY)."""
@@ -295,18 +344,23 @@ class MSSQLTarget:
                 total += len(batch)
         return total
 
-    def _text_to_value(self, col: str) -> str:
+    def _text_to_value(self, col: str, data_type: str | None = None) -> str:
         """SQL expression turning a #sre_load text column back into its value.
 
         SQL NULL arrives as NULL_TOKEN. BULK INSERT also loads a quoted empty
         string ("") as NULL, so with that method a NULL in #sre_load can only be
-        an empty string; the client method reads "" as ''.
+        an empty string; the client method reads "" as ''. Snowflake unloads
+        BINARY as hex, which binary target columns decode with CONVERT style 2.
         """
         c = _q(col)
         if self.load_method == "bulk_insert":
-            return (f"CASE WHEN {c} IS NULL THEN N'' "
-                    f"WHEN {c} = N'{NULL_TOKEN}' THEN NULL ELSE {c} END")
-        return f"NULLIF({c}, N'{NULL_TOKEN}')"
+            value = (f"CASE WHEN {c} IS NULL THEN N'' "
+                     f"WHEN {c} = N'{NULL_TOKEN}' THEN NULL ELSE {c} END")
+        else:
+            value = f"NULLIF({c}, N'{NULL_TOKEN}')"
+        if data_type in ("binary", "varbinary", "image"):
+            return f"CONVERT(VARBINARY(MAX), NULLIF({c}, N'{NULL_TOKEN}'), 2)"
+        return value
 
     def _merge_sql(self, table, source, columns, key_columns) -> str:
         on = " AND ".join(f"t.{_q(k)} = s.{_q(k)}" for k in key_columns)
@@ -322,6 +376,20 @@ class MSSQLTarget:
 
     # --- contract --------------------------------------------------------------
 
+    def acquire_lock(self, name: str) -> bool:
+        """Take an exclusive application lock without waiting. It is owned by
+        the session, so it is held across commits until the connection closes
+        (SQL Server sp_getapplock)."""
+        cur = self._cursor()
+        cur.execute("SET NOCOUNT ON; DECLARE @rc INT; "
+                    "EXEC @rc = sp_getapplock @Resource = ?, @LockMode = 'Exclusive', "
+                    "@LockOwner = 'Session', @LockTimeout = 0; SELECT @rc",
+                    _lock_name(name, 255))
+        rc = cur.fetchone()[0]
+        cur.close()
+        self._lock = _lock_name(name, 255) if rc >= 0 else None
+        return self._lock is not None
+
     def truncate(self, table: str) -> None:
         cur = self._cursor()
         cur.execute(f"TRUNCATE TABLE {table}")   # transactional on SQL Server
@@ -330,6 +398,7 @@ class MSSQLTarget:
     def write(self, table, columns, rows, mode="append", key_columns=None) -> None:
         if not rows:
             return
+        rows = self._exact_decimals(rows)
         cur = self._cursor(fast=True)
         cols = ", ".join(_q(c) for c in columns)
         placeholders = ", ".join(["?"] * len(columns))
@@ -349,6 +418,7 @@ class MSSQLTarget:
     def delete(self, table, key_columns, key_rows) -> None:
         if not key_rows:
             return
+        key_rows = self._exact_decimals(key_rows)
         cur = self._cursor(fast=True)
         where = " AND ".join(f"{_q(k)} = ?" for k in key_columns)
         self._bind_types(cur, key_rows)
@@ -367,9 +437,11 @@ class MSSQLTarget:
         joining typed, ordered keys is about three times faster than merging
         straight from the text columns."""
         cur = self._cursor(fast=True)
+        types = self._column_types(cur, table)
         self._text_temp(cur, "#sre_load", columns)
         n = self._fill_from_csv(cur, "#sre_load", columns, csv_path, rel_path)
-        select = ", ".join(f"{self._text_to_value(c)} AS {_q(c)}" for c in columns)
+        select = ", ".join(f"{self._text_to_value(c, types.get(c.lower()))} AS {_q(c)}"
+                           for c in columns)
         cols = ", ".join(_q(c) for c in columns)
         if mode == "upsert":
             self._typed_temp(cur, "#sre_typed", table, columns)
@@ -403,7 +475,27 @@ class MSSQLTarget:
         self.conn.rollback()
 
     def close(self):
+        # Release explicitly: with ODBC connection pooling, close() can return
+        # the session to the pool instead of logging out, which would keep a
+        # session-owned lock (tested: the lock outlived close()).
+        if getattr(self, "_lock", None):
+            try:
+                cur = self._cursor()
+                cur.execute("EXEC sp_releaseapplock @Resource = ?, @LockOwner = 'Session'",
+                            self._lock)
+                cur.close()
+            except Exception:  # noqa: BLE001 - logging out releases it anyway
+                pass
         self.conn.close()
+
+
+def _lock_name(name: str, limit: int) -> str:
+    """Lock name within the database's length limit (hashed if too long)."""
+    import hashlib
+    full = f"simple_reverse_etl:{name}"
+    if len(full) <= limit:
+        return full
+    return "simple_reverse_etl:" + hashlib.sha256(name.encode()).hexdigest()[: limit - 19]
 
 
 def make_target(cfg):

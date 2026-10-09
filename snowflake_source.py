@@ -39,15 +39,19 @@ def _private_key_der(path: str, passphrase: str | None) -> bytes:
     )
 
 
-def connect(cfg) -> "snowflake.connector.SnowflakeConnection":
-    """Open a Snowflake connection.
+def connect(cfg, query_tag: str | None = None) -> "snowflake.connector.SnowflakeConnection":
+    """Open a Snowflake connection and prepare the session (see _prepare_session).
 
     connection_name: reuse a named entry from ~/.snowflake/connections.toml.
     PAT (demo): the token is presented in place of the password.
     Key-pair (prod): an RSA private key is loaded and passed as private_key.
+
+    arrow_number_to_decimal=True returns NUMBER columns with a scale as exact
+    decimals; the connector's default returns them as 64-bit floats, which
+    silently rounds values with more than about 15 significant digits.
     """
     # Overrides applied on top of whichever auth path we use.
-    overrides: dict = {}
+    overrides: dict = {"arrow_number_to_decimal": True}
     for attr in ("role", "warehouse", "database", "schema"):
         val = getattr(cfg, attr, None)
         if val:
@@ -56,21 +60,52 @@ def connect(cfg) -> "snowflake.connector.SnowflakeConnection":
     if getattr(cfg, "connection_name", None):
         log.info("Connecting to Snowflake via connections.toml entry %r",
                  cfg.connection_name)
-        return snowflake.connector.connect(
+        conn = snowflake.connector.connect(
             connection_name=cfg.connection_name, **overrides
         )
+    else:
+        kwargs: dict = {"account": cfg.account, "user": cfg.user, **overrides}
+        if cfg.auth_method == "keypair":
+            kwargs["private_key"] = _private_key_der(
+                cfg.private_key_path, cfg.private_key_passphrase
+            )
+        else:  # pat
+            kwargs["password"] = cfg.pat
+        log.info("Connecting to Snowflake account=%s user=%s auth=%s",
+                 cfg.account, cfg.user, cfg.auth_method)
+        conn = snowflake.connector.connect(**kwargs)
+    _prepare_session(conn, query_tag, getattr(cfg, "statement_timeout", None))
+    return conn
 
-    kwargs: dict = {"account": cfg.account, "user": cfg.user, **overrides}
-    if cfg.auth_method == "keypair":
-        kwargs["private_key"] = _private_key_der(
-            cfg.private_key_path, cfg.private_key_passphrase
-        )
-    else:  # pat
-        kwargs["password"] = cfg.pat
 
-    log.info("Connecting to Snowflake account=%s user=%s auth=%s",
-             cfg.account, cfg.user, cfg.auth_method)
-    return snowflake.connector.connect(**kwargs)
+# Text formats for Transport B's CSV unload. The account defaults keep only
+# milliseconds (and drop fractional seconds from TIME); these keep the full
+# microseconds and write time-zone offsets as +hh:mm, which MySQL and SQL
+# Server parse. They do not affect Transport A, which reads Arrow, not text.
+UNLOAD_OUTPUT_FORMATS = {
+    "TIMESTAMP_NTZ_OUTPUT_FORMAT": "YYYY-MM-DD HH24:MI:SS.FF6",
+    "TIMESTAMP_LTZ_OUTPUT_FORMAT": "YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM",
+    "TIMESTAMP_TZ_OUTPUT_FORMAT": "YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM",
+    "TIME_OUTPUT_FORMAT": "HH24:MI:SS.FF6",
+    "DATE_OUTPUT_FORMAT": "YYYY-MM-DD",
+}
+
+
+def _prepare_session(conn, query_tag: str | None, statement_timeout: int | None) -> None:
+    """Session settings: unload text formats, an optional QUERY_TAG (so the
+    job's queries can be found in query history), and an optional statement
+    timeout in seconds."""
+    settings = dict(UNLOAD_OUTPUT_FORMATS)
+    if query_tag:
+        settings["QUERY_TAG"] = query_tag
+    if statement_timeout:
+        settings["STATEMENT_TIMEOUT_IN_SECONDS"] = int(statement_timeout)
+    assignments = ", ".join(f"{k} = %({k})s" for k in settings)
+    cur = conn.cursor()
+    try:
+        cur.execute(f"ALTER SESSION SET {assignments}", settings)
+    finally:
+        cur.close()
 
 
 def read_query_batches(conn, query: str, params=None) -> Iterator[pd.DataFrame]:
@@ -175,18 +210,21 @@ def build_outbox_changes_query(outbox: str, key_columns) -> str:
     """Net change per key among un-exported outbox rows up to %(cutoff)s.
 
     A stream reports an UPDATE as a DELETE row (old values) plus an INSERT row
-    (new values), both with METADATA$ISUPDATE = TRUE; the DELETE half is
-    dropped. The outbox can hold several consumes (e.g. after a failed run), so
-    only the latest change per key is kept. Result: _CDC_ACTION = 'INSERT' rows
-    are upserts, _CDC_ACTION = 'DELETE' rows are deletes, one row per key.
+    (new values), both with METADATA$ISUPDATE = TRUE. The outbox can hold
+    several consumes (e.g. after a failed run), so only the latest consume per
+    key counts; within one consume an INSERT beats a DELETE for the same key.
+    That keeps the new values of an ordinary update, and still deletes the old
+    key when an UPDATE changed a key column (its DELETE half is then the only
+    row for the old key). Result: _CDC_ACTION = 'INSERT' rows are upserts,
+    _CDC_ACTION = 'DELETE' rows are deletes, one row per key.
     """
     keys = ", ".join(key_columns)
     return (
         f"SELECT * FROM {outbox} "
         f"WHERE _CDC_EXPORTED = FALSE "
         f"AND _CDC_LOADED_AT <= TO_TIMESTAMP_TZ(%(cutoff)s, '{_CUTOFF_FMT}') "
-        f"AND NOT (_CDC_ACTION = 'DELETE' AND _CDC_ISUPDATE) "
-        f"QUALIFY ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY _CDC_LOADED_AT DESC) = 1"
+        f"QUALIFY ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY _CDC_LOADED_AT DESC, "
+        f"IFF(_CDC_ACTION = 'INSERT', 0, 1)) = 1"
     )
 
 
@@ -254,18 +292,21 @@ def unload_to_stage(conn, query: str, stage_path: str, params=None) -> int:
     """COPY the result of `query` into compressed CSV files at `stage_path`
     (e.g. '@my_stage/claims/'). Returns the number of rows unloaded.
 
-    HEADER=TRUE writes a header row (the bulk loader skips it). OVERWRITE=TRUE
-    keeps re-runs idempotent. SQL NULL is written as the literal token '__NULL__'
-    (with EMPTY_FIELD_AS_NULL=FALSE so real empty strings stay distinct); the
-    bulk loader turns that token back into NULL. The '__NULL__' sentinel must
-    match targets.NULL_TOKEN.
+    HEADER=TRUE writes a header row (the bulk loader skips it). The caller
+    empties `stage_path` first; INCLUDE_QUERY_ID=TRUE puts the query ID in the
+    file names, so if Snowflake internally retries the unload it removes the
+    partial files of the failed attempt instead of leaving duplicates (which
+    OVERWRITE=TRUE does not guarantee). SQL NULL is written as the literal token
+    '__NULL__' (with EMPTY_FIELD_AS_NULL=FALSE so real empty strings stay
+    distinct); the bulk loader turns that token back into NULL. The '__NULL__'
+    sentinel must match targets.NULL_TOKEN.
     """
     sql = (
         f"COPY INTO {stage_path} FROM ({query}) "
         "FILE_FORMAT = (TYPE = CSV COMPRESSION = GZIP "
         "FIELD_OPTIONALLY_ENCLOSED_BY = '\"' NULL_IF = ('__NULL__') "
         "EMPTY_FIELD_AS_NULL = FALSE) "
-        "HEADER = TRUE OVERWRITE = TRUE MAX_FILE_SIZE = 100000000"
+        "HEADER = TRUE INCLUDE_QUERY_ID = TRUE MAX_FILE_SIZE = 100000000"
     )
     cur = conn.cursor()
     try:
