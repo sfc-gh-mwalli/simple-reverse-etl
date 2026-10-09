@@ -14,6 +14,7 @@ demo/.env.demo
 # Runtime artifacts
 sync_state.json
 sync_state_unload.json
+sync_state_volume_*.json
 _unload_tmp/
 *.gz
 *.csv

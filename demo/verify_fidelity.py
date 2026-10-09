@@ -29,7 +29,7 @@ TARGETS = {"pull": "FIDELITY_PULL", "unload": "FIDELITY_UNLOAD"}
 
 # (case name, TXT, AMT, TS) -- ID is assigned in order. TXT is also copied into
 # NOTE, an unbounded text column (NVARCHAR(MAX) / TEXT), which drivers bind
-# differently from a bounded one.
+# differently from a bounded one. FLAG is a BOOLEAN, alternating by ID.
 CASES = [
     ("all NULL",            None, None, None),
     ("empty string, zero",  "''", "0", "'2026-10-08 16:43:51.247'"),
@@ -44,9 +44,9 @@ CASES = [
 
 TARGET_DDL = {
     "mysql": ("CREATE TABLE {t} (ID BIGINT PRIMARY KEY, TXT VARCHAR(100), "
-              "AMT DECIMAL(12,4), TS DATETIME(3), NOTE TEXT) DEFAULT CHARSET=utf8mb4"),
+              "AMT DECIMAL(12,4), TS DATETIME(3), NOTE TEXT, FLAG TINYINT(1)) DEFAULT CHARSET=utf8mb4"),
     "mssql": ("CREATE TABLE {t} (ID BIGINT NOT NULL PRIMARY KEY, TXT NVARCHAR(100), "
-              "AMT DECIMAL(12,4), TS DATETIME2(3), NOTE NVARCHAR(MAX))"),
+              "AMT DECIMAL(12,4), TS DATETIME2(3), NOTE NVARCHAR(MAX), FLAG BIT)"),
 }
 
 
@@ -62,13 +62,14 @@ def main() -> int:
     conn = sf.connect(SnowflakeConfig.from_env())
     cur = conn.cursor()
     cur.execute(f"CREATE OR REPLACE TABLE {SRC} "
-                "(ID NUMBER NOT NULL, TXT VARCHAR(100), AMT NUMBER(12,4), TS TIMESTAMP_NTZ(3), NOTE VARCHAR)")
+                "(ID NUMBER NOT NULL, TXT VARCHAR(100), AMT NUMBER(12,4), TS TIMESTAMP_NTZ(3), NOTE VARCHAR, FLAG BOOLEAN)")
     values = ", ".join(f"({i}, {_sql(t)}, {_sql(a)}, {_sql(ts)})"
                        for i, (_, t, a, ts) in enumerate(CASES, 1))
     cur.execute(f"INSERT INTO {SRC} (ID, TXT, AMT, TS) VALUES {values}")
-    cur.execute(f"UPDATE {SRC} SET NOTE = TXT")
+    # FLAG: a BOOLEAN (unloaded as true/false), NULL in the all-NULL case.
+    cur.execute(f"UPDATE {SRC} SET NOTE = TXT, FLAG = IFF(ID = 1, NULL, MOD(ID, 2) = 0)")
     expected = {r[0]: r[1:] for r in cur.execute(
-        f"SELECT ID, TXT, AMT, TS, NOTE FROM {SRC} ORDER BY ID").fetchall()}
+        f"SELECT ID, TXT, AMT, TS, NOTE, FLAG FROM {SRC} ORDER BY ID").fetchall()}
 
     target = make_target(tcfg)
     tc = target.conn.cursor()
@@ -88,7 +89,7 @@ def main() -> int:
                 print(f"FAIL  {transport}: sync exited non-zero")
                 failures += 1
                 continue
-            tc.execute(f"SELECT ID, TXT, AMT, TS, NOTE FROM {table} ORDER BY ID")
+            tc.execute(f"SELECT ID, TXT, AMT, TS, NOTE, FLAG FROM {table} ORDER BY ID")
             actual = {int(r[0]): tuple(r[1:]) for r in tc.fetchall()}
             target.commit()
             for i, (name, *_rest) in enumerate(CASES, 1):

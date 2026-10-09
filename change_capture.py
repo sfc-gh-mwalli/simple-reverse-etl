@@ -101,7 +101,7 @@ def _saved_watermark(state: dict, source: str, target: str):
 
 def plan_full(sf_conn, args) -> LoadPlan:
     return LoadPlan(
-        upsert_query=sf.build_full_query(args.source),
+        upsert_query=sf.build_full_query(args.source, args.key_cols),
         truncate=args.mode == "truncate",
         summary=lambda n, d: f"Full load complete: {n} rows -> {args.target}",
     )
@@ -136,7 +136,8 @@ def plan_hwm(sf_conn, args) -> LoadPlan | None:
     # 3. The transport reads the window and writes it to the target.
     return LoadPlan(
         upsert_query=sf.build_hwm_query(args.source, args.hwm_col,
-                                        has_watermark=last is not None),
+                                        has_watermark=last is not None,
+                                        key_columns=args.key_cols),
         params={"watermark": last, "ceiling": ceiling},
         truncate=args.mode == "truncate",
         on_commit=save_watermark,

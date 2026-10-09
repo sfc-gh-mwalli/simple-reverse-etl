@@ -38,4 +38,57 @@ IF OBJECT_ID(N'dbo.DENTAL_CLAIMS_CDC', N'U') IS NULL
         AMOUNT       DECIMAL(10,2) NULL,
         UPDATED_AT   DATETIME2(3)  NULL
     );
+
+-- Part 7 (volume test): wide claims tables, loaded by demo/run_volume.sh.
+--   VOLUME_CLAIMS         <- Transport A
+--   VOLUME_CLAIMS_STAGED  <- Transport B
+IF OBJECT_ID(N'dbo.VOLUME_CLAIMS', N'U') IS NULL
+    CREATE TABLE dbo.VOLUME_CLAIMS (
+        CLAIM_ID            BIGINT NOT NULL PRIMARY KEY,
+        MEMBER_ID           BIGINT,
+        PROVIDER_ID         BIGINT,
+        PROVIDER_NPI        NVARCHAR(10),
+        PLAN_CODE           NVARCHAR(12),
+        CLAIM_TYPE          NVARCHAR(20),
+        PROCEDURE_CODE      NVARCHAR(5),
+        TOOTH_NUMBER        NVARCHAR(2),
+        TOOTH_SURFACE       NVARCHAR(5),
+        DIAGNOSIS_CODE      NVARCHAR(8),
+        SERVICE_DATE        DATE,
+        SUBMITTED_AT        DATETIME2(3),
+        CLAIM_STATUS        NVARCHAR(20),
+        BILLED_AMOUNT       DECIMAL(12,2),
+        ALLOWED_AMOUNT      DECIMAL(12,2),
+        PAID_AMOUNT         DECIMAL(12,2),
+        MEMBER_RESP_AMOUNT  DECIMAL(12,2),
+        DENIAL_REASON       NVARCHAR(100),
+        PAYER_NOTE          NVARCHAR(500),
+        IS_EMERGENCY        BIT,
+        UPDATED_AT          DATETIME2(3)
+    );
+
+IF OBJECT_ID(N'dbo.VOLUME_CLAIMS_STAGED', N'U') IS NULL
+    CREATE TABLE dbo.VOLUME_CLAIMS_STAGED (
+        CLAIM_ID            BIGINT NOT NULL PRIMARY KEY,
+        MEMBER_ID           BIGINT,
+        PROVIDER_ID         BIGINT,
+        PROVIDER_NPI        NVARCHAR(10),
+        PLAN_CODE           NVARCHAR(12),
+        CLAIM_TYPE          NVARCHAR(20),
+        PROCEDURE_CODE      NVARCHAR(5),
+        TOOTH_NUMBER        NVARCHAR(2),
+        TOOTH_SURFACE       NVARCHAR(5),
+        DIAGNOSIS_CODE      NVARCHAR(8),
+        SERVICE_DATE        DATE,
+        SUBMITTED_AT        DATETIME2(3),
+        CLAIM_STATUS        NVARCHAR(20),
+        BILLED_AMOUNT       DECIMAL(12,2),
+        ALLOWED_AMOUNT      DECIMAL(12,2),
+        PAID_AMOUNT         DECIMAL(12,2),
+        MEMBER_RESP_AMOUNT  DECIMAL(12,2),
+        DENIAL_REASON       NVARCHAR(100),
+        PAYER_NOTE          NVARCHAR(500),
+        IS_EMERGENCY        BIT,
+        UPDATED_AT          DATETIME2(3)
+    );
 GO

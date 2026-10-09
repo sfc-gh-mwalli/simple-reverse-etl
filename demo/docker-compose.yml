@@ -2,7 +2,10 @@ services:
   mysql:
     image: mysql:8.4
     container_name: simple-reverse-etl-demo-mysql
-    command: --local-infile=1
+    # local-infile: required for Transport B (LOAD DATA LOCAL INFILE).
+    # The stock 128 MB buffer pool and 100 MB redo log make the Part 7 volume
+    # test (several GB) disk-bound; a production server is sized for its data.
+    command: --local-infile=1 --innodb-buffer-pool-size=2G --innodb-redo-log-capacity=2G
     environment:
       MYSQL_ROOT_PASSWORD: demopw
       MYSQL_DATABASE: DENTAL_RPT

@@ -108,9 +108,10 @@ def unload_apply(sf_conn, target, plan, args) -> tuple[int, int]:
     """Returns (rows unloaded for writing, rows unloaded for deletion).
 
     Layout: <stage>/<target>/upsert/ holds the rows to write and, in stream
-    mode, <stage>/<target>/delete/ holds the keys to delete. The same layout is
-    mirrored under --local-dir. Files are kept until the next run for the same
-    target, so a failed load can be inspected or retried.
+    mode, <stage>/<target>/delete/ holds the keys to delete. They are retrieved
+    into --local-dir/upsert/ and --local-dir/delete/. Stage files are kept until
+    the next run for the same target; --local-dir is emptied at the start of
+    every run, so use a separate --local-dir per concurrently scheduled target.
     """
     stage_path = f"{args.stage.rstrip('/')}/{args.target.lower()}/"
     local_dir = os.path.abspath(args.local_dir)

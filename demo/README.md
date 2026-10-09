@@ -10,8 +10,10 @@ stream-based change capture, including deletes.
 For architecture, network requirements, and production guidance, see the
 [top-level README](../README.md). For an unattended run of the whole sequence, use
 `./demo/run_demo.sh`. To check that awkward values (NULL, empty strings, non-ASCII text,
-quotes, newlines) survive both transports unchanged, run `./demo/verify_fidelity.sh`.
-Both accept `DEMO_TARGET=mssql`.
+quotes, newlines, booleans) survive both transports unchanged, run
+`./demo/verify_fidelity.sh`. To measure throughput at volume, see
+[Part 7](#part-7-volume-test-optional-not-for-the-live-session). All accept
+`DEMO_TARGET=mssql`.
 
 **Presentation time:** approximately 25 minutes for Parts 1 to 4 and 6, plus 10 minutes for
 Part 5 (stream-based change capture). Part 5 can be skipped.
@@ -26,6 +28,7 @@ Part 5 (stream-based change capture). Part 5 can be skipped.
 - [Part 4: Incremental load on both transports](#part-4-incremental-load-on-both-transports)
 - [Part 5: Stream-based change capture](#part-5-stream-based-change-capture)
 - [Part 6: Summary](#part-6-summary)
+- [Part 7: Volume test (optional, not for the live session)](#part-7-volume-test-optional-not-for-the-live-session)
 - [Troubleshooting](#troubleshooting)
 - [Cleanup](#cleanup)
 
@@ -147,11 +150,11 @@ three are empty.
 |---|---|
 | [config.py](../config.py) | All settings come from environment variables. Credentials are never in code. |
 | [snowflake_source.py](../snowflake_source.py#L42) `connect()` | Uses a named connection, key-pair, or PAT. The connection is outbound HTTPS to Snowflake. |
-| [snowflake_source.py](../snowflake_source.py#L103) `build_hwm_query()` | Selects rows between the last watermark and a ceiling captured before the read, so rows updated during the read are not skipped. |
+| [snowflake_source.py](../snowflake_source.py#L110) `build_hwm_query()` | Selects rows between the last watermark and a ceiling captured before the read, so rows updated during the read are not skipped. |
 | [snowflake_source.py](../snowflake_source.py#L76) `read_query_batches()` | Streams the result as Apache Arrow batches with `fetch_pandas_batches()`. Memory use depends on batch size, not result size. |
 | [transports.py](../transports.py#L45) `pull_apply()` | Transport A: writes each Arrow batch to the target. |
 | [targets.py](../targets.py#L65) `MySQLTarget.write()` | MySQL: batched `INSERT ... ON DUPLICATE KEY UPDATE`, an upsert on the primary key. |
-| [targets.py](../targets.py#L313) `MSSQLTarget.write()` | SQL Server: batched inserts into a session temporary table, then one `MERGE`. |
+| [targets.py](../targets.py#L330) `MSSQLTarget.write()` | SQL Server: batched inserts into a session temporary table, then one `MERGE`. |
 | [change_capture.py](../change_capture.py#L13) module docstring, "High-water-mark (hwm) state" | Where the watermark is stored, its format, and the four-step cycle. |
 | [change_capture.py](../change_capture.py#L110) `plan_hwm()` | The four steps in code: read the saved watermark, read the ceiling, load and commit, and only then save the new watermark. The watermark is saved only after the target commit in [sync.py](../sync.py#L142) `main()`, so a failed run leaves it unchanged and is retried from the same point. |
 
@@ -210,10 +213,10 @@ cat sync_state.json
 | File | What to show |
 |---|---|
 | [transports.py](../transports.py#L107) `unload_apply()` | Transport B: unload to the stage, retrieve the files, and bulk load. Change capture is the same code as Transport A; only `--transport unload` differs. |
-| [snowflake_source.py](../snowflake_source.py#L245) `unload_to_stage()` | `COPY INTO @stage` writes gzip-compressed CSV files. Snowflake does the export work, in parallel for large results. NULLs are written as a sentinel so they can be told apart from empty strings. |
-| [snowflake_source.py](../snowflake_source.py#L278) `get_files()` | `GET` downloads the files over outbound HTTPS. With an external stage in production, the job reads the bucket with the cloud provider's SDK instead. |
-| [targets.py](../targets.py#L105) `MySQLTarget.bulk_load()` | MySQL: `LOAD DATA LOCAL INFILE ... REPLACE`, the native bulk loader, with sentinel values converted back to NULL. |
-| [targets.py](../targets.py#L341) `MSSQLTarget.bulk_load()` | SQL Server: `BULK INSERT` (or client-side batches) into a temporary table, then `MERGE`, with sentinel values converted back to NULL. |
+| [snowflake_source.py](../snowflake_source.py#L253) `unload_to_stage()` | `COPY INTO @stage` writes gzip-compressed CSV files. Snowflake does the export work, in parallel for large results. NULLs are written as a sentinel so they can be told apart from empty strings. |
+| [snowflake_source.py](../snowflake_source.py#L286) `get_files()` | `GET` downloads the files over outbound HTTPS. With an external stage in production, the job reads the bucket with the cloud provider's SDK instead. |
+| [targets.py](../targets.py#L122) `MySQLTarget.bulk_load()` | MySQL: `LOAD DATA LOCAL INFILE ... REPLACE`, the native bulk loader, with sentinel values converted back to NULL. |
+| [targets.py](../targets.py#L358) `MSSQLTarget.bulk_load()` | SQL Server: `BULK INSERT` (or client-side batches) into a text temporary table, sentinel values converted back to NULL, then conversion into a typed temporary table indexed on the key and one `MERGE`. |
 
 ### Run the initial load
 
@@ -364,10 +367,10 @@ insert through the stream, once with each transport.
 
 | File | What to show |
 |---|---|
-| [snowflake_source.py](../snowflake_source.py#L122) `consume_stream_to_outbox()` | `INSERT INTO outbox SELECT ... FROM stream` in one transaction. Committing it advances the stream offset; the changes are now held in the outbox. |
-| [change_capture.py](../change_capture.py#L148) `plan_stream()` | Consumes the stream, snapshots the cutoff, and plans two queries: rows to upsert and keys to delete. |
-| [snowflake_source.py](../snowflake_source.py#L166) `build_outbox_changes_query()` | Runs in Snowflake: drops the old-value half of each update and keeps the latest change per key (`QUALIFY ROW_NUMBER()`). |
-| [snowflake_source.py](../snowflake_source.py#L201) `purge_outbox()` | After the target commit and the acknowledgement, deletes delivered rows (immediately by default, or after `--outbox-retention-days`). |
+| [snowflake_source.py](../snowflake_source.py#L130) `consume_stream_to_outbox()` | `INSERT INTO outbox SELECT ... FROM stream` in one transaction. Committing it advances the stream offset; the changes are now held in the outbox. |
+| [change_capture.py](../change_capture.py#L149) `plan_stream()` | Consumes the stream, snapshots the cutoff, and plans two queries: rows to upsert and keys to delete. |
+| [snowflake_source.py](../snowflake_source.py#L174) `build_outbox_changes_query()` | Runs in Snowflake: drops the old-value half of each update and keeps the latest change per key (`QUALIFY ROW_NUMBER()`). |
+| [snowflake_source.py](../snowflake_source.py#L209) `purge_outbox()` | After the target commit and the acknowledgement, deletes delivered rows (immediately by default, or after `--outbox-retention-days`). |
 
 **Talking points**
 
@@ -523,6 +526,79 @@ Use `SYSTEM$ALLOWLIST()` to get the list of hosts for an account.
 
 ---
 
+## Part 7: Volume test (optional, not for the live session)
+
+The 20-row table keeps the demo readable but says nothing about throughput. Part 7 loads
+a wide, realistic table at volume on both transports and times it. It takes too long to
+run during a presentation: about 15 minutes on MySQL and about 45 minutes on SQL Server
+under emulation. Run it beforehand and show the results, or use it to test performance
+after changing the code or the target configuration. What it showed is summarized in
+[Performance](../README.md#performance) in the main README.
+
+**What it does:**
+
+1. **`[S9]`** creates `VOLUME_CLAIMS` in Snowflake: 10,000,000 fictitious dental claims
+   with 21 columns (IDs, plan and procedure codes, dates, four amounts, a nullable denial
+   reason, a free-text note of up to 400 characters, a `BOOLEAN`, and `UPDATED_AT`).
+   About 30% of the notes are NULL and some are empty strings or contain quotes and
+   commas. Generation takes about 20 seconds.
+2. **Initial load.** Both transports load the full table with the production command
+   (`--change-capture hwm --mode upsert`; there is no watermark yet, so every row is
+   sent): Transport A into `VOLUME_CLAIMS`, Transport B into `VOLUME_CLAIMS_STAGED`.
+3. **`[S10]`** makes a large upstream change: it inserts 5,000,000 new claims and updates
+   1,000,000 existing ones (status, paid amounts, denial reason, note).
+4. **Incremental load.** Both transports run again. The watermark selects exactly the
+   6,000,000 changed rows, which are applied as upserts to tables that already hold
+   10,000,000 rows.
+
+After steps 2 and 4, [volume_check.py](volume_check.py) compares 19 aggregates of each
+target table with Snowflake: row count, key range, the four amount sums, rows per status,
+NULL and empty-string counts, total note length, the date range, and the `BOOLEAN` count.
+A lost update, a truncated note, or a mis-converted value changes at least one of them.
+
+**Run it:**
+
+```bash
+./demo/run_volume.sh                                           # MySQL
+DEMO_TARGET=mssql ./demo/run_volume.sh                         # SQL Server, BULK INSERT
+DEMO_TARGET=mssql TARGET_MSSQL_LOAD_METHOD=client ./demo/run_volume.sh
+```
+
+The script ends with a timing summary and exits non-zero if any check fails or if an
+incremental run does not send exactly 6,000,000 rows. Transport B needs about 3 GB free
+in `_unload_tmp` (more for SQL Server `bulk_insert`, which writes a UTF-16 copy of each
+file). The individual commands, if you want to run a step by hand in Snowsight and the
+terminal:
+
+```bash
+SRC=SIMPLE_REVERSE_ETL_DEMO.DENTAL.VOLUME_CLAIMS
+time python sync.py --source $SRC --target VOLUME_CLAIMS \
+    --change-capture hwm --hwm-col UPDATED_AT --mode upsert --key-cols CLAIM_ID \
+    --state-file sync_state_volume_a.json
+
+time python sync.py --transport unload --source $SRC --target VOLUME_CLAIMS_STAGED \
+    --change-capture hwm --hwm-col UPDATED_AT --mode upsert --key-cols CLAIM_ID \
+    --stage @SIMPLE_REVERSE_ETL_DEMO.DENTAL.UNLOAD_STAGE \
+    --state-file sync_state_volume_b.json --local-dir _unload_tmp
+```
+
+**Measured results** (Apple silicon laptop, Docker with 8 CPUs and 8 GB, Snowflake small
+warehouse; seconds, with rows per second in parentheses):
+
+| Target | Initial load, 10M rows: A | Initial load: B | Incremental, 5M inserts + 1M updates: A | Incremental: B |
+|---|---|---|---|---|
+| MySQL 8.4 | 260 s (38k/s) | 127 s (79k/s) | 165 s (36k/s) | 99 s (61k/s) |
+| SQL Server 2022, `bulk_insert` | 505 s (20k/s) | 518 s (19k/s) | 298 s (20k/s) | 355 s (17k/s) |
+| SQL Server 2022, `client` | 489 s (20k/s) | 764 s (13k/s) | 296 s (20k/s) | 507 s (12k/s) |
+
+All runs matched Snowflake on every check. Run-to-run variation on the emulated SQL Server
+container was large: Transport A's initial load took 387 s in one run and 505 s in
+another with the same code.
+
+`reset_demo.sh` drops `VOLUME_CLAIMS` and empties the two volume target tables.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Resolution |
@@ -549,7 +625,7 @@ data, then remove the local state and retrieved files:
 
 ```bash
 docker compose -f demo/docker-compose.yml --profile mssql down -v
-rm -rf sync_state.json sync_state_unload.json _unload_tmp
+rm -rf sync_state.json sync_state_unload.json sync_state_volume_*.json _unload_tmp
 ```
 
 To remove the Snowflake objects, run the following in Snowsight. This includes the stage

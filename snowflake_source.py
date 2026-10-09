@@ -96,24 +96,32 @@ def scalar(conn, query: str, params=None):
 
 # --- change-capture query builders ------------------------------------------
 
-def build_full_query(source: str) -> str:
-    return f"SELECT * FROM {source}"
+def build_full_query(source: str, key_columns=None) -> str:
+    return f"SELECT * FROM {source}" + _order_by(key_columns)
 
 
-def build_hwm_query(source: str, hwm_col: str, has_watermark: bool = True) -> str:
+def _order_by(key_columns) -> str:
+    """Deliver rows in key order when keys are known: the target inserts them
+    into its primary-key index sequentially instead of at random positions,
+    which matters once the table no longer fits in the database's memory."""
+    return f" ORDER BY {', '.join(key_columns)}" if key_columns else ""
+
+
+def build_hwm_query(source: str, hwm_col: str, has_watermark: bool = True,
+                    key_columns=None) -> str:
     """Rows strictly above the last watermark, up to a captured ceiling.
 
     The ceiling (bound with %(ceiling)s at call time) is read first via
     SELECT MAX(hwm_col) so a value that keeps advancing during the read can't
     cause us to skip late rows. With has_watermark=False (first run, no saved
     watermark and no --hwm-start) there is no lower bound: every row up to the
-    ceiling is selected.
+    ceiling is selected. Row order does not matter for correctness, because the
+    watermark is saved only after the whole window has committed.
     """
     lower = f"{hwm_col} > %(watermark)s AND " if has_watermark else ""
     return (
         f"SELECT * FROM {source} "
-        f"WHERE {lower}{hwm_col} <= %(ceiling)s "
-        f"ORDER BY {hwm_col}"
+        f"WHERE {lower}{hwm_col} <= %(ceiling)s" + _order_by(key_columns)
     )
 
 
