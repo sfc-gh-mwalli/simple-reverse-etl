@@ -54,10 +54,7 @@ Snowflake through the Snowflake Connector for Python, consumes the result as Apa
 batches (`fetch_pandas_batches`), and writes each batch to the target with batched
 parameterized statements. Upserts use `INSERT ... ON DUPLICATE KEY UPDATE` on MySQL and a
 session temporary table plus `MERGE` on SQL Server. Memory use is bounded by batch size
-rather than result size. No files are written and nothing is staged. (For network
-planning only: the connector downloads larger query results from Snowflake-managed
-storage, so the stage storage hosts must be reachable for Transport A too; see
-[Network and firewall requirements](#network-and-firewall-requirements).)
+rather than result size. The job writes no files.
 
 ```mermaid
 ---
