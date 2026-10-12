@@ -57,6 +57,9 @@ session temporary table plus `MERGE` on SQL Server. Memory use is bounded by bat
 rather than result size. No files are written.
 
 ```mermaid
+---
+title: Transport A — connector pull (--transport pull)
+---
 flowchart LR
   subgraph cloud [Snowflake]
     sf[("Snowflake account")]
@@ -79,6 +82,9 @@ extraction in parallel, and the target load reads local files rather than a live
 set.
 
 ```mermaid
+---
+title: Transport B — unload and bulk load (--transport unload)
+---
 flowchart LR
   subgraph cloud [Snowflake]
     sf[("Snowflake account")]
