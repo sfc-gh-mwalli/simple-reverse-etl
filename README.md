@@ -18,6 +18,7 @@ databases without introducing an additional integration platform.
 - [Choosing a transport](#choosing-a-transport)
 - [Change capture and write semantics](#change-capture-and-write-semantics)
   - [Stream-based change capture](#stream-based-change-capture)
+  - [Write modes](#write-modes)
   - [Key requirements](#key-requirements)
   - [Data types](#data-types)
 - [Configuration](#configuration)
@@ -112,138 +113,6 @@ different targets can overlap.
 The code follows the same split: [change_capture.py](change_capture.py) builds a plan of
 what to send, [transports.py](transports.py) moves it, [targets.py](targets.py) writes to
 MySQL or SQL Server, and [sync.py](sync.py) commits the target and then records progress.
-
-## Failure handling and recovery
-
-The job has no internal retry. A failed run leaves the target and the recorded progress
-in a state from which the next scheduled run (or a manual rerun) continues correctly, and
-reports what happened through its exit code.
-
-| Exit code | Meaning | Target | Progress (watermark or outbox) | Action |
-|---|---|---|---|---|
-| 0 | Success, or nothing to send | Committed | Advanced | None |
-| 1 | The run failed | Rolled back (see the exceptions below) | Unchanged | Rerun after fixing the cause |
-| 2 | Invalid options | Untouched; nothing connected | Unchanged | Fix the command line |
-| 3 | Another run for the same target holds the lock | Untouched | Unchanged | None; the next run proceeds |
-| 4 | The target committed, but saving progress failed | Committed | Not advanced | Rerun; it re-sends the same rows |
-
-Exceptions to "rolled back": Transport A with `none` or `hwm` keeps the batches committed
-before the failure (`--commit-rows`), and on MySQL `TRUNCATE TABLE` causes an implicit
-commit, so a failed full load can leave the table empty or partly loaded. In both cases
-the rerun completes the load (tested).
-
-**What was tested.** [demo/verify_recovery.py](demo/verify_recovery.py) runs every
-combination of change capture and write mode (`none`/`truncate`, `hwm`/`upsert`,
-`stream`/`upsert`) with both transports, and injects each of these
-failures in turn:
-
-- the Snowflake read or unload fails
-- the target write fails part-way (after some rows are written)
-- the target commit fails
-- saving the watermark or acknowledging the outbox fails after the target committed
-- the process is killed (no rollback, no clean disconnect) right after a write
-
-Before the failure the source receives inserts, an update, and, where the mode can see
-them, a delete and an `UPDATE` that changes the key value. After each failure the job is
-run twice more without a failure, and the target is compared with Snowflake. On MySQL 8.4,
-SQL Server 2022 with `bulk_insert`, and SQL Server 2022 with `client`, all 28 applicable
-scenarios ended with the target matching the source, the failed run exiting non-zero, and
-both later runs exiting 0. An earlier version of the job also accepted `hwm` with
-`--mode append`; in the same tests two or three rows were delivered twice after a
-Transport A partial commit or a progress-save failure, so that combination is now
-rejected.
-
-**Runbook.**
-
-- *A run failed (exit 1).* Read the logged error, fix the cause, and rerun. No cleanup is
-  needed. For Transport B the failed run's files are on the stage and in `--local-dir`;
-  the next run deletes them before it unloads.
-- *Progress was not saved (exit 4).* Rerun. The rows are sent again and upserted, so the
-  result is unchanged.
-- *The run reported the lock (exit 3) unexpectedly.* Another run is active for the same
-  target, possibly still in progress from an earlier schedule. The lock belongs to that
-  run's database session and is released when it ends, including when the process is
-  killed and the connection drops (tested).
-- *Reload a target from scratch.* For `hwm`, remove the target's entry from the state file
-  (or the file) and run with `--mode upsert`, or run a full load
-  (`--change-capture none --mode truncate`) first. For `stream`, run a full load; pending
-  outbox changes are then applied again on the next stream run, which is harmless.
-- *The stream is stale or the source table was replaced.* Recreate the stream, run a full
-  load, and resume stream runs (see
-  [Stream-based change capture](#stream-based-change-capture)).
-
-## Operations
-
-- **One run per target at a time.** At start the job takes a lock named after
-  `--target` in the target database (MySQL `GET_LOCK`, SQL Server `sp_getapplock` owned by
-  the session) and exits with code 3 if another run holds it. Both are released when the
-  session ends. The lock does not cover a shared `--local-dir`: give each target its own
-  folder.
-- **Run summary.** Each run logs one line beginning `RUN_SUMMARY` followed by JSON with
-  the status (`ok`, `no_changes`, `failed`, `locked`, `state_not_saved`), source, target,
-  change capture, transport, mode, rows written and deleted, and duration. Collect it with
-  the scheduler's logs to alert on failures and track volumes.
-- **Query tag.** The job's Snowflake session sets `QUERY_TAG` to
-  `simple-reverse-etl:<target>`, so its queries and their warehouse time can be found in
-  query history.
-- **Timeouts.** By default nothing times out. `SF_STATEMENT_TIMEOUT_SECONDS` sets the
-  session's `STATEMENT_TIMEOUT_IN_SECONDS` (tested: a longer statement is cancelled with
-  "Statement reached its statement or warehouse timeout"). `TARGET_STATEMENT_TIMEOUT_SECONDS`
-  sets the MySQL client read and write timeouts or the `pyodbc` query timeout for SQL
-  Server. Set them above the longest expected statement; a timeout fails the run (exit 1).
-  The Python connector's own `network_timeout` is "By default, none/infinite"
-  ([connector API](https://docs.snowflake.com/en/developer-guide/python-connector/python-connector-api)).
-- **Monitoring.** Alert on non-zero exit codes. In stream mode also watch `STALE_AFTER`
-  (`SHOW STREAMS`) and the number of un-exported outbox rows
-  (`SELECT COUNT_IF(NOT _CDC_EXPORTED) FROM <outbox>`), which grows when runs fail.
-- **Many tables.** Run one job per table. Tables are synchronized independently and at
-  different times, so foreign keys between target tables can be violated between runs;
-  load parent tables first, or do not enforce those foreign keys on the target.
-- **Schema changes.** The job selects `SELECT * FROM <source>`. Adding a source column
-  makes runs fail (exit 1, tested on both targets) until the target has the column; dropping or renaming one requires the
-  same change on the target. A view as `--source` (tested with `none` and `hwm`) pins the
-  projection so that source changes do not reach the target unplanned.
-
-## Security
-
-- **Credentials.** Use key-pair authentication for the Snowflake service user, and supply
-  credentials from a secret store rather than a file on the job host.
-- **Snowflake privileges.** The job's role needs `USAGE` on the warehouse, database, and
-  schema and `SELECT` on the source (for a view, "the SELECT privilege is not required on
-  the objects from which the view is created"). Stream mode also needs `SELECT` on the
-  stream and `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on the outbox. Transport B with an
-  internal stage needs `WRITE` ("PUT, REMOVE, COPY INTO <location>") and `READ` ("GET,
-  LIST") on the stage ([privileges](https://docs.snowflake.com/en/user-guide/security-access-control-privileges)).
-  The demo ran with an administrative role; these grants are taken from the documentation
-  and were not tested with a least-privilege role.
-- **Governance policies carry through.** For unloads the documentation states: "If a
-  masking policy is set on a column, the masking policy is applied to the data resulting
-  in unauthorized users seeing masked data in the column"
-  ([COPY INTO \<location\>](https://docs.snowflake.com/en/sql-reference/sql/copy-into-location)).
-  The job receives what its role is allowed to see, so masked values are what reach the
-  target. Grant the job's role access deliberately.
-- **Data at rest.** Files on an internal stage are "client-side encrypted by
-  default"; files downloaded by `GET` are written with permissions `600` by default. The
-  decompressed CSV files in `--local-dir` are plain text. They are deleted after a
-  successful run (tested), but remain after a failed run or with `--keep-files`. Put
-  `--local-dir` on an encrypted volume readable only by the job (and, for
-  `bulk_insert`, by the SQL Server service account).
-- **Connections to the target.** SQL Server connections are encrypted and the certificate
-  is verified by default (`TARGET_MSSQL_ENCRYPT`, `TARGET_MSSQL_TRUST_SERVER_CERT`).
-  MySQL connections require a verified server certificate: set `TARGET_MYSQL_SSL_CA` to
-  the CA that issued it, or the job refuses to connect. Tested: without a CA the job
-  refused to connect, the server's CA was accepted, and an unrelated CA was rejected.
-  Host-name checking (`TARGET_MYSQL_SSL_VERIFY_IDENTITY`, default `yes`) requires a
-  certificate issued for the host name used in `TARGET_HOST`.
-  `TARGET_MYSQL_SSL_VERIFY=no` turns verification off and logs a warning. PyMySQL then
-  still negotiated TLS with the test server (`Ssl_cipher` `TLS_AES_256_GCM_SHA384`), but
-  without checking whom it was talking to.
-- **Input handling.** Table, column, stream, outbox, and stage names given on the command
-  line are checked against a plain-identifier pattern before they are used in SQL; values
-  are always bound as parameters.
-- **Logs.** Driver errors are logged as reported by the database and can include key
-  values (tested: MySQL reported `Duplicate entry '1' for key ...`). Treat job logs as
-  containing data.
 
 ## Network and firewall requirements
 
@@ -727,6 +596,138 @@ targets whose columns are defined in lower case and compared case-sensitively.
   `NULL`, empty strings, the sentinel text, non-ASCII text, quotes, commas, embedded
   newlines, padded text, and booleans through both transports and compares every value with
   Snowflake, on either demo target.
+
+## Failure handling and recovery
+
+The job has no internal retry. A failed run leaves the target and the recorded progress
+in a state from which the next scheduled run (or a manual rerun) continues correctly, and
+reports what happened through its exit code.
+
+| Exit code | Meaning | Target | Progress (watermark or outbox) | Action |
+|---|---|---|---|---|
+| 0 | Success, or nothing to send | Committed | Advanced | None |
+| 1 | The run failed | Rolled back (see the exceptions below) | Unchanged | Rerun after fixing the cause |
+| 2 | Invalid options | Untouched; nothing connected | Unchanged | Fix the command line |
+| 3 | Another run for the same target holds the lock | Untouched | Unchanged | None; the next run proceeds |
+| 4 | The target committed, but saving progress failed | Committed | Not advanced | Rerun; it re-sends the same rows |
+
+Exceptions to "rolled back": Transport A with `none` or `hwm` keeps the batches committed
+before the failure (`--commit-rows`), and on MySQL `TRUNCATE TABLE` causes an implicit
+commit, so a failed full load can leave the table empty or partly loaded. In both cases
+the rerun completes the load (tested).
+
+**What was tested.** [demo/verify_recovery.py](demo/verify_recovery.py) runs every
+combination of change capture and write mode (`none`/`truncate`, `hwm`/`upsert`,
+`stream`/`upsert`) with both transports, and injects each of these
+failures in turn:
+
+- the Snowflake read or unload fails
+- the target write fails part-way (after some rows are written)
+- the target commit fails
+- saving the watermark or acknowledging the outbox fails after the target committed
+- the process is killed (no rollback, no clean disconnect) right after a write
+
+Before the failure the source receives inserts, an update, and, where the mode can see
+them, a delete and an `UPDATE` that changes the key value. After each failure the job is
+run twice more without a failure, and the target is compared with Snowflake. On MySQL 8.4,
+SQL Server 2022 with `bulk_insert`, and SQL Server 2022 with `client`, all 28 applicable
+scenarios ended with the target matching the source, the failed run exiting non-zero, and
+both later runs exiting 0. An earlier version of the job also accepted `hwm` with
+`--mode append`; in the same tests two or three rows were delivered twice after a
+Transport A partial commit or a progress-save failure, so that combination is now
+rejected.
+
+**Runbook.**
+
+- *A run failed (exit 1).* Read the logged error, fix the cause, and rerun. No cleanup is
+  needed. For Transport B the failed run's files are on the stage and in `--local-dir`;
+  the next run deletes them before it unloads.
+- *Progress was not saved (exit 4).* Rerun. The rows are sent again and upserted, so the
+  result is unchanged.
+- *The run reported the lock (exit 3) unexpectedly.* Another run is active for the same
+  target, possibly still in progress from an earlier schedule. The lock belongs to that
+  run's database session and is released when it ends, including when the process is
+  killed and the connection drops (tested).
+- *Reload a target from scratch.* For `hwm`, remove the target's entry from the state file
+  (or the file) and run with `--mode upsert`, or run a full load
+  (`--change-capture none --mode truncate`) first. For `stream`, run a full load; pending
+  outbox changes are then applied again on the next stream run, which is harmless.
+- *The stream is stale or the source table was replaced.* Recreate the stream, run a full
+  load, and resume stream runs (see
+  [Stream-based change capture](#stream-based-change-capture)).
+
+## Operations
+
+- **One run per target at a time.** At start the job takes a lock named after
+  `--target` in the target database (MySQL `GET_LOCK`, SQL Server `sp_getapplock` owned by
+  the session) and exits with code 3 if another run holds it. Both are released when the
+  session ends. The lock does not cover a shared `--local-dir`: give each target its own
+  folder.
+- **Run summary.** Each run logs one line beginning `RUN_SUMMARY` followed by JSON with
+  the status (`ok`, `no_changes`, `failed`, `locked`, `state_not_saved`), source, target,
+  change capture, transport, mode, rows written and deleted, and duration. Collect it with
+  the scheduler's logs to alert on failures and track volumes.
+- **Query tag.** The job's Snowflake session sets `QUERY_TAG` to
+  `simple-reverse-etl:<target>`, so its queries and their warehouse time can be found in
+  query history.
+- **Timeouts.** By default nothing times out. `SF_STATEMENT_TIMEOUT_SECONDS` sets the
+  session's `STATEMENT_TIMEOUT_IN_SECONDS` (tested: a longer statement is cancelled with
+  "Statement reached its statement or warehouse timeout"). `TARGET_STATEMENT_TIMEOUT_SECONDS`
+  sets the MySQL client read and write timeouts or the `pyodbc` query timeout for SQL
+  Server. Set them above the longest expected statement; a timeout fails the run (exit 1).
+  The Python connector's own `network_timeout` is "By default, none/infinite"
+  ([connector API](https://docs.snowflake.com/en/developer-guide/python-connector/python-connector-api)).
+- **Monitoring.** Alert on non-zero exit codes. In stream mode also watch `STALE_AFTER`
+  (`SHOW STREAMS`) and the number of un-exported outbox rows
+  (`SELECT COUNT_IF(NOT _CDC_EXPORTED) FROM <outbox>`), which grows when runs fail.
+- **Many tables.** Run one job per table. Tables are synchronized independently and at
+  different times, so foreign keys between target tables can be violated between runs;
+  load parent tables first, or do not enforce those foreign keys on the target.
+- **Schema changes.** The job selects `SELECT * FROM <source>`. Adding a source column
+  makes runs fail (exit 1, tested on both targets) until the target has the column; dropping or renaming one requires the
+  same change on the target. A view as `--source` (tested with `none` and `hwm`) pins the
+  projection so that source changes do not reach the target unplanned.
+
+## Security
+
+- **Credentials.** Use key-pair authentication for the Snowflake service user, and supply
+  credentials from a secret store rather than a file on the job host.
+- **Snowflake privileges.** The job's role needs `USAGE` on the warehouse, database, and
+  schema and `SELECT` on the source (for a view, "the SELECT privilege is not required on
+  the objects from which the view is created"). Stream mode also needs `SELECT` on the
+  stream and `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on the outbox. Transport B with an
+  internal stage needs `WRITE` ("PUT, REMOVE, COPY INTO <location>") and `READ` ("GET,
+  LIST") on the stage ([privileges](https://docs.snowflake.com/en/user-guide/security-access-control-privileges)).
+  The demo ran with an administrative role; these grants are taken from the documentation
+  and were not tested with a least-privilege role.
+- **Governance policies carry through.** For unloads the documentation states: "If a
+  masking policy is set on a column, the masking policy is applied to the data resulting
+  in unauthorized users seeing masked data in the column"
+  ([COPY INTO \<location\>](https://docs.snowflake.com/en/sql-reference/sql/copy-into-location)).
+  The job receives what its role is allowed to see, so masked values are what reach the
+  target. Grant the job's role access deliberately.
+- **Data at rest.** Files on an internal stage are "client-side encrypted by
+  default"; files downloaded by `GET` are written with permissions `600` by default. The
+  decompressed CSV files in `--local-dir` are plain text. They are deleted after a
+  successful run (tested), but remain after a failed run or with `--keep-files`. Put
+  `--local-dir` on an encrypted volume readable only by the job (and, for
+  `bulk_insert`, by the SQL Server service account).
+- **Connections to the target.** SQL Server connections are encrypted and the certificate
+  is verified by default (`TARGET_MSSQL_ENCRYPT`, `TARGET_MSSQL_TRUST_SERVER_CERT`).
+  MySQL connections require a verified server certificate: set `TARGET_MYSQL_SSL_CA` to
+  the CA that issued it, or the job refuses to connect. Tested: without a CA the job
+  refused to connect, the server's CA was accepted, and an unrelated CA was rejected.
+  Host-name checking (`TARGET_MYSQL_SSL_VERIFY_IDENTITY`, default `yes`) requires a
+  certificate issued for the host name used in `TARGET_HOST`.
+  `TARGET_MYSQL_SSL_VERIFY=no` turns verification off and logs a warning. PyMySQL then
+  still negotiated TLS with the test server (`Ssl_cipher` `TLS_AES_256_GCM_SHA384`), but
+  without checking whom it was talking to.
+- **Input handling.** Table, column, stream, outbox, and stage names given on the command
+  line are checked against a plain-identifier pattern before they are used in SQL; values
+  are always bound as parameters.
+- **Logs.** Driver errors are logged as reported by the database and can include key
+  values (tested: MySQL reported `Duplicate entry '1' for key ...`). Treat job logs as
+  containing data.
 
 ## Performance
 
