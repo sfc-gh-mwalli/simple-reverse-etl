@@ -42,39 +42,60 @@ Snowflake or any other cloud service. This matches the common enterprise posture
 which traffic from the internet into the data center is denied, while controlled
 egress from approved hosts is permitted.
 
-```mermaid
-flowchart LR
-  subgraph onprem [On-premises network]
-    job["SimpleReverseETL job"]
-    db[("MySQL / SQL Server")]
-  end
-  subgraph cloud [Cloud]
-    sf[("Snowflake account")]
-    stg[("Stage storage")]
-  end
-  job -->|"outbound HTTPS"| sf
-  job -->|"outbound HTTPS"| stg
-  job -->|"local network"| db
-```
-
 A single job, `sync.py`, combines a change-capture mode (`--change-capture`: which rows
 to send) with one of two transports (`--transport`: how they move). Every change-capture
 mode works with both transports, and both transports write to the same target tables with
-the same write modes.
+the same write modes. The transports differ in **who extracts the data and how it reaches
+the target**. The arrows in the diagrams show the direction in which data moves; every
+connection that crosses the network boundary is opened by the job, over outbound HTTPS.
 
 **Transport A — connector pull (`--transport pull`, the default).** The job queries
 Snowflake through the Snowflake Connector for Python, consumes the result as Apache Arrow
 batches (`fetch_pandas_batches`), and writes each batch to the target with batched
 parameterized statements. Upserts use `INSERT ... ON DUPLICATE KEY UPDATE` on MySQL and a
 session temporary table plus `MERGE` on SQL Server. Memory use is bounded by batch size
-rather than result size.
+rather than result size. No files are written.
+
+```mermaid
+flowchart LR
+  subgraph cloud [Snowflake]
+    sf[("Snowflake account")]
+    res[("Stage storage<br/>(larger results)")]
+  end
+  subgraph onprem [On-premises network]
+    job["SimpleReverseETL job"]
+    db[("MySQL / SQL Server")]
+  end
+  sf -->|"1. query result, Arrow batches<br/>(job pulls, outbound HTTPS)"| job
+  res -.->|"larger results<br/>(job pulls, outbound HTTPS)"| job
+  job -->|"2. batched INSERT / upsert<br/>(local network)"| db
+```
 
 **Transport B — unload and bulk load (`--transport unload`).** The job issues
 `COPY INTO <stage>` so that Snowflake writes the result as compressed CSV files, retrieves
 the files, and loads them with the target database's native bulk loader
 (`LOAD DATA LOCAL INFILE` on MySQL, `BULK INSERT` on SQL Server). Snowflake does the
 extraction in parallel, and the target load reads local files rather than a live result
-set. Each run first empties the stage path for the target and then unloads with
+set.
+
+```mermaid
+flowchart LR
+  subgraph cloud [Snowflake]
+    sf[("Snowflake account")]
+    stg[("Stage<br/>CSV.gz files")]
+  end
+  subgraph onprem [On-premises network]
+    job["SimpleReverseETL job"]
+    files[/"--local-dir<br/>CSV files"/]
+    db[("MySQL / SQL Server")]
+  end
+  sf -->|"1. COPY INTO, issued by the job:<br/>Snowflake writes files in parallel"| stg
+  stg -->|"2. GET files<br/>(job pulls, outbound HTTPS)"| job
+  job -->|"3. decompress"| files
+  files -->|"4. LOAD DATA / BULK INSERT<br/>(native bulk loader)"| db
+```
+
+Each run first empties the stage path for the target and then unloads with
 `INCLUDE_QUERY_ID = TRUE`, which the documentation recommends over `OVERWRITE = TRUE`
 because after an internal retry "Snowflake deletes the partial set of unloaded files"
 ([COPY INTO \<location\>](https://docs.snowflake.com/en/sql-reference/sql/copy-into-location)).

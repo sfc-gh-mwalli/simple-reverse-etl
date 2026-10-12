@@ -145,8 +145,14 @@ certificate) and source the script again.
 - `UPDATED_AT` is the high-water-mark column. Incremental runs select only rows whose
   `UPDATED_AT` is later than the last successful run.
 - The target is on premises, behind a firewall that blocks inbound connections. The job
-  therefore runs on premises and makes only outbound connections. Show the diagram and
-  the network requirements table in the [top-level README](../README.md#network-and-firewall-requirements).
+  therefore runs on premises and makes only outbound connections. Show the
+  [two transport diagrams](../README.md#architecture) and the
+  [network requirements table](../README.md#network-and-firewall-requirements).
+- The two transports are the key distinction for the rest of the demo. **Transport A**
+  (Part 2): the job runs a query and streams the result rows straight into the target
+  with batched statements; no files. **Transport B** (Part 3): Snowflake exports the
+  result as files to a stage, the job downloads them, and the target's native bulk
+  loader reads them. Change capture (Parts 4 and 5) works the same with either.
 
 **TablePlus:** open `DENTAL_CLAIMS`, `DENTAL_CLAIMS_STAGED`, and `DENTAL_CLAIMS_CDC`. All
 three are empty.
