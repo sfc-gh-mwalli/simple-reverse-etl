@@ -14,13 +14,13 @@ databases without introducing an additional integration platform.
 ## Contents
 
 - [Architecture](#architecture)
-- [Network and firewall requirements](#network-and-firewall-requirements)
 - [Choosing a transport](#choosing-a-transport)
 - [Change capture and write semantics](#change-capture-and-write-semantics)
   - [Stream-based change capture](#stream-based-change-capture)
   - [Write modes](#write-modes)
   - [Key requirements](#key-requirements)
   - [Data types](#data-types)
+- [Network and firewall requirements](#network-and-firewall-requirements)
 - [Configuration](#configuration)
 - [Usage](#usage)
 - [Failure handling and recovery](#failure-handling-and-recovery)
@@ -113,94 +113,6 @@ different targets can overlap.
 The code follows the same split: [change_capture.py](change_capture.py) builds a plan of
 what to send, [transports.py](transports.py) moves it, [targets.py](targets.py) writes to
 MySQL or SQL Server, and [sync.py](sync.py) commits the target and then records progress.
-
-## Network and firewall requirements
-
-This design removes the need for **inbound** connectivity into the on-premises network.
-It does **not** remove the need for connectivity altogether: the on-premises host must be
-permitted to make **outbound** connections to Snowflake, to the storage behind the stage,
-or both, depending on the transport. If the host has no approved egress path, neither
-transport will work without a change to network policy. Confirm this requirement with
-your network and security teams before adopting the approach.
-
-### Transport A, and Transport B as implemented in this repository
-
-Both require outbound HTTPS from the job host to the Snowflake account. Note that the
-account hostname alone is not sufficient:
-
-| Endpoint | Port | Purpose |
-|---|---|---|
-| Account hostname (`<account>.snowflakecomputing.com`) | 443 | Authentication and query execution |
-| Stage storage hosts (Snowflake-managed S3, Azure Blob, or GCS) | 443 | File transfer (`GET`/`PUT`) and retrieval of larger result sets |
-| OCSP cache and responder hosts | 80 | TLS certificate revocation checks performed by the connector |
-
-The stage storage requirement applies even when the job uses no stage of its own:
-
-- Snowflake's [Allowing Host names](https://docs.snowflake.com/en/user-guide/hostname-allowlist)
-  page states that "All Snowflake clients, such as SnowSQL, JDBC driver, and ODBC driver,
-  require permanent access to cloud storage (Amazon S3, Google Cloud Storage, or Microsoft
-  Azure) ... to perform various runtime operations."
-- The Snowflake Community article
-  [Snowflake JDBC throws error while fetching large data](https://community.snowflake.com/s/article/Snowflake-JDBC-throws-error-while-fetching-large-data-JDBC-driver-internal-error-Timeout-waiting-for-the-download-of-chunk0)
-  explains why this matters for queries: "Retrieving large results requires clients to have
-  full network access with certificate passthrough to all STAGE endpoints."
-
-Obtain the authoritative list for your account with
-[`SYSTEM$ALLOWLIST()`](https://docs.snowflake.com/en/sql-reference/functions/system_allowlist)
-and validate connectivity from the job host with
-[SnowCD](https://docs.snowflake.com/en/user-guide/snowcd), or with the connector's built-in
-diagnostics (`enable_connection_diag=True`). Additional points:
-
-- **Snowflake network policies.** If the account or service user is governed by a network
-  policy, the public egress IP addresses of the job host (or its proxy/NAT) must be allowed.
-- **Proxies.** The Snowflake Connector for Python 3.x/4.x honors the `HTTP_PROXY`,
-  `HTTPS_PROXY`, and `NO_PROXY` environment variables; `NO_PROXY` can route stage storage
-  traffic (for example `.amazonaws.com`) around the proxy.
-- **TLS inspection.** Snowflake does not support proxies that re-sign TLS traffic. Where an
-  inspecting proxy is in the path, configure it to pass Snowflake and stage-storage traffic
-  through unmodified.
-- **Private connectivity.** Where egress over the public internet is not permitted, AWS
-  PrivateLink, Azure Private Link, or Google Cloud Private Service Connect can carry this
-  traffic over a private path. Use
-  [`SYSTEM$ALLOWLIST_PRIVATELINK()`](https://docs.snowflake.com/en/sql-reference/functions/system_allowlist_privatelink)
-  for the corresponding host list.
-- **Connector versions.** This implementation is validated with connector 4.x. The
-  [5.x connector](https://docs.snowflake.com/en/developer-guide/python-connector/python-connector-universal-core)
-  (currently in preview) reads proxy environment variables only when `use_proxy_env=True`
-  is set, and replaces OCSP checks with optional CRL checks, which changes the endpoints
-  above. Pin the connector version in production and review these items before upgrading.
-
-As implemented here, Transport B unloads to a Snowflake internal stage (by default the
-user stage, `@~/simple_reverse_etl`; any internal named stage can be set with `--stage`)
-and retrieves files with `GET`, so its connectivity requirements are the same as
-Transport A's.
-
-### Transport B with an external stage
-
-In production, Transport B is typically configured against an **external stage** backed
-by object storage (Amazon S3, Azure Blob Storage, or Google Cloud Storage). This changes
-the connectivity profile:
-
-- Snowflake writes to the bucket through a
-  [storage integration](https://docs.snowflake.com/en/sql-reference/sql/create-storage-integration);
-  the on-premises host reads from the bucket with its **own** credentials (for example an
-  IAM role or user, a SAS token, or a service principal) using the cloud provider's SDK or
-  CLI. `GET` is not supported for external stages.
-- The job host therefore requires outbound HTTPS to the **object storage endpoint**, and the
-  bucket policy must permit access from the job host's identity and network location.
-- If the unload is issued by the job, the host still requires connectivity to Snowflake for
-  the `COPY INTO` statement. If the unload is instead scheduled inside Snowflake (for
-  example with a [task](https://docs.snowflake.com/en/user-guide/tasks-intro)), the job
-  host needs **only** bucket access and no direct Snowflake connectivity. This variant is
-  often the easiest to approve, but it requires a way for the job to detect newly
-  unloaded files and is not implemented in this repository.
-
-| Deployment | Job host needs outbound access to |
-|---|---|
-| Transport A | Snowflake account, stage storage, OCSP |
-| Transport B, internal stage (this repository) | Snowflake account, stage storage, OCSP |
-| Transport B, external stage, unload issued by the job | Snowflake account and OCSP (for `COPY INTO`), plus the customer bucket |
-| Transport B, external stage, unload scheduled in Snowflake | The customer bucket only |
 
 ## Choosing a transport
 
@@ -437,6 +349,94 @@ The job reads `NUMBER` columns as exact decimals (the connector's default would 
 15 digits), and binds decimals to SQL Server as text, because `pyodbc` with
 `fast_executemany` rounds long decimals. For Transport B it sets the session's timestamp,
 time, and date output formats to keep microseconds and write offsets as `+hh:mm`.
+
+## Network and firewall requirements
+
+This design removes the need for **inbound** connectivity into the on-premises network.
+It does **not** remove the need for connectivity altogether: the on-premises host must be
+permitted to make **outbound** connections to Snowflake, to the storage behind the stage,
+or both, depending on the transport. If the host has no approved egress path, neither
+transport will work without a change to network policy. Confirm this requirement with
+your network and security teams before adopting the approach.
+
+### Transport A, and Transport B as implemented in this repository
+
+Both require outbound HTTPS from the job host to the Snowflake account. Note that the
+account hostname alone is not sufficient:
+
+| Endpoint | Port | Purpose |
+|---|---|---|
+| Account hostname (`<account>.snowflakecomputing.com`) | 443 | Authentication and query execution |
+| Stage storage hosts (Snowflake-managed S3, Azure Blob, or GCS) | 443 | File transfer (`GET`/`PUT`) and retrieval of larger result sets |
+| OCSP cache and responder hosts | 80 | TLS certificate revocation checks performed by the connector |
+
+The stage storage requirement applies even when the job uses no stage of its own:
+
+- Snowflake's [Allowing Host names](https://docs.snowflake.com/en/user-guide/hostname-allowlist)
+  page states that "All Snowflake clients, such as SnowSQL, JDBC driver, and ODBC driver,
+  require permanent access to cloud storage (Amazon S3, Google Cloud Storage, or Microsoft
+  Azure) ... to perform various runtime operations."
+- The Snowflake Community article
+  [Snowflake JDBC throws error while fetching large data](https://community.snowflake.com/s/article/Snowflake-JDBC-throws-error-while-fetching-large-data-JDBC-driver-internal-error-Timeout-waiting-for-the-download-of-chunk0)
+  explains why this matters for queries: "Retrieving large results requires clients to have
+  full network access with certificate passthrough to all STAGE endpoints."
+
+Obtain the authoritative list for your account with
+[`SYSTEM$ALLOWLIST()`](https://docs.snowflake.com/en/sql-reference/functions/system_allowlist)
+and validate connectivity from the job host with
+[SnowCD](https://docs.snowflake.com/en/user-guide/snowcd), or with the connector's built-in
+diagnostics (`enable_connection_diag=True`). Additional points:
+
+- **Snowflake network policies.** If the account or service user is governed by a network
+  policy, the public egress IP addresses of the job host (or its proxy/NAT) must be allowed.
+- **Proxies.** The Snowflake Connector for Python 3.x/4.x honors the `HTTP_PROXY`,
+  `HTTPS_PROXY`, and `NO_PROXY` environment variables; `NO_PROXY` can route stage storage
+  traffic (for example `.amazonaws.com`) around the proxy.
+- **TLS inspection.** Snowflake does not support proxies that re-sign TLS traffic. Where an
+  inspecting proxy is in the path, configure it to pass Snowflake and stage-storage traffic
+  through unmodified.
+- **Private connectivity.** Where egress over the public internet is not permitted, AWS
+  PrivateLink, Azure Private Link, or Google Cloud Private Service Connect can carry this
+  traffic over a private path. Use
+  [`SYSTEM$ALLOWLIST_PRIVATELINK()`](https://docs.snowflake.com/en/sql-reference/functions/system_allowlist_privatelink)
+  for the corresponding host list.
+- **Connector versions.** This implementation is validated with connector 4.x. The
+  [5.x connector](https://docs.snowflake.com/en/developer-guide/python-connector/python-connector-universal-core)
+  (currently in preview) reads proxy environment variables only when `use_proxy_env=True`
+  is set, and replaces OCSP checks with optional CRL checks, which changes the endpoints
+  above. Pin the connector version in production and review these items before upgrading.
+
+As implemented here, Transport B unloads to a Snowflake internal stage (by default the
+user stage, `@~/simple_reverse_etl`; any internal named stage can be set with `--stage`)
+and retrieves files with `GET`, so its connectivity requirements are the same as
+Transport A's.
+
+### Transport B with an external stage
+
+In production, Transport B is typically configured against an **external stage** backed
+by object storage (Amazon S3, Azure Blob Storage, or Google Cloud Storage). This changes
+the connectivity profile:
+
+- Snowflake writes to the bucket through a
+  [storage integration](https://docs.snowflake.com/en/sql-reference/sql/create-storage-integration);
+  the on-premises host reads from the bucket with its **own** credentials (for example an
+  IAM role or user, a SAS token, or a service principal) using the cloud provider's SDK or
+  CLI. `GET` is not supported for external stages.
+- The job host therefore requires outbound HTTPS to the **object storage endpoint**, and the
+  bucket policy must permit access from the job host's identity and network location.
+- If the unload is issued by the job, the host still requires connectivity to Snowflake for
+  the `COPY INTO` statement. If the unload is instead scheduled inside Snowflake (for
+  example with a [task](https://docs.snowflake.com/en/user-guide/tasks-intro)), the job
+  host needs **only** bucket access and no direct Snowflake connectivity. This variant is
+  often the easiest to approve, but it requires a way for the job to detect newly
+  unloaded files and is not implemented in this repository.
+
+| Deployment | Job host needs outbound access to |
+|---|---|
+| Transport A | Snowflake account, stage storage, OCSP |
+| Transport B, internal stage (this repository) | Snowflake account, stage storage, OCSP |
+| Transport B, external stage, unload issued by the job | Snowflake account and OCSP (for `COPY INTO`), plus the customer bucket |
+| Transport B, external stage, unload scheduled in Snowflake | The customer bucket only |
 
 ## Configuration
 
