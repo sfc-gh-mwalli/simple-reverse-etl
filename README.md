@@ -265,6 +265,17 @@ account hostname alone is not sufficient:
 | Stage storage hosts (Snowflake-managed S3, Azure Blob, or GCS) | 443 | File transfer (`GET`/`PUT`) and retrieval of larger result sets |
 | OCSP cache and responder hosts | 80 | TLS certificate revocation checks performed by the connector |
 
+The stage storage requirement applies even when the job uses no stage of its own:
+
+- Snowflake's [Allowing Host names](https://docs.snowflake.com/en/user-guide/hostname-allowlist)
+  page states that "All Snowflake clients, such as SnowSQL, JDBC driver, and ODBC driver,
+  require permanent access to cloud storage (Amazon S3, Google Cloud Storage, or Microsoft
+  Azure) ... to perform various runtime operations."
+- The Snowflake Community article
+  [Snowflake JDBC throws error while fetching large data](https://community.snowflake.com/s/article/Snowflake-JDBC-throws-error-while-fetching-large-data-JDBC-driver-internal-error-Timeout-waiting-for-the-download-of-chunk0)
+  explains why this matters for queries: "Retrieving large results requires clients to have
+  full network access with certificate passthrough to all STAGE endpoints."
+
 Obtain the authoritative list for your account with
 [`SYSTEM$ALLOWLIST()`](https://docs.snowflake.com/en/sql-reference/functions/system_allowlist)
 and validate connectivity from the job host with
